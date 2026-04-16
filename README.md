@@ -2,6 +2,14 @@
 
 A comprehensive O-RAN (Open RAN) Non-Terrestrial Network (NTN) simulation module for ns-3, deeply integrating with mmWave, satellite (SNS3), and ns3-ai modules.
 
+<p align="center">
+  <img src="visualization/oran_ntn_constellation_ric.gif" alt="LEO Constellation with Space RICs" width="600"/>
+</p>
+
+<p align="center">
+  <img src="visualization/oran_ntn_xapp_decisions.gif" alt="9 xApps Concurrent Decisions" width="800"/>
+</p>
+
 ## Overview
 
 This module implements the complete Space-O-RAN architecture for LEO satellite networks with:
@@ -17,6 +25,10 @@ This module implements the complete Space-O-RAN architecture for LEO satellite n
 - **Dual Connectivity** manager for simultaneous TN + NTN bearer support
 
 ## Architecture
+
+<p align="center">
+  <img src="visualization/oran_ntn_architecture.png" alt="Module Architecture" width="800"/>
+</p>
 
 ```
 Non-RT RIC (SMO)
@@ -92,6 +104,12 @@ oran-ntn/
 │   └── oran_ntn_space_ric_agent.py        # Space RIC AI agent
 └── CMakeLists.txt
 ```
+
+## Realistic NTN KPM Metrics
+
+<p align="center">
+  <img src="visualization/oran_ntn_kpm_metrics.png" alt="KPM Metrics" width="800"/>
+</p>
 
 ## Key Features
 
