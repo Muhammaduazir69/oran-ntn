@@ -153,6 +153,7 @@ class OranNtnE2TestCase : public TestCase
         e2node->SubmitKpmMeasurement(report);
 
         // Run simulation to deliver report (with feeder link delay)
+        Simulator::Stop(MilliSeconds(100));
         Simulator::Run();
         Simulator::Destroy();
     }
