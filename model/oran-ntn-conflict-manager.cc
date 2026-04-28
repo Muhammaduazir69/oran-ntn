@@ -165,6 +165,23 @@ OranNtnConflictManager::GetResourceKey(const E2RcAction& action) const
     case E2RcActionType::ENERGY_PROFILE_UPDATE:
         oss << "energy:gnb" << action.targetGnbId;
         break;
+    case E2RcActionType::ACTION_THZ_FREQ_SELECT:
+    case E2RcActionType::ACTION_THZ_WINDOW_HOP:
+        oss << "thz-freq:gnb" << action.targetGnbId;
+        break;
+    case E2RcActionType::ACTION_THZ_BEAM_CODEBOOK:
+        oss << "thz-codebook:gnb" << action.targetGnbId << ":beam" << action.targetBeamId;
+        break;
+    case E2RcActionType::ACTION_THZ_RIS_CONFIG:
+        oss << "thz-ris:gnb" << action.targetGnbId;
+        break;
+    case E2RcActionType::ACTION_THZ_WAVEFORM_SELECT:
+    case E2RcActionType::ACTION_THZ_ISAC_MODE:
+        oss << "thz-isac:gnb" << action.targetGnbId;
+        break;
+    case E2RcActionType::ACTION_THZ_POWER_BACKOFF:
+        oss << "thz-power:gnb" << action.targetGnbId << ":beam" << action.targetBeamId;
+        break;
     }
 
     return oss.str();
