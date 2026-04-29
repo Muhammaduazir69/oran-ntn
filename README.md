@@ -1,170 +1,106 @@
-# O-RAN NTN Module for ns-3
+<h1 align="center">oran-ntn</h1>
 
-A comprehensive O-RAN (Open RAN) Non-Terrestrial Network (NTN) simulation module for ns-3, deeply integrating with mmWave, satellite (SNS3), and ns3-ai modules.
+<p align="center"><strong>Space O-RAN reference implementation for ns-3.43 — 13 xApps, 28 E2SM-RC actions, 11 A1 policies, 5 conflict strategies, 4 federated aggregators</strong></p>
 
 <p align="center">
-  <img src="visualization/oran_ntn_constellation_ric.gif" alt="LEO Constellation with Space RICs" width="600"/>
+  <a href="https://www.nsnam.org"><img src="https://img.shields.io/badge/ns--3-3.43-blue.svg"/></a>
+  <a href="https://www.gnu.org/licenses/old-licenses/gpl-2.0.en.html"><img src="https://img.shields.io/badge/license-GPL--2.0-green.svg"/></a>
+  <img src="https://img.shields.io/badge/O--RAN-WG3%20E2AP%20%2F%20WG2%20A1AP-orange.svg"/>
+  <img src="https://img.shields.io/badge/xApps-13-purple.svg"/>
+  <img src="https://img.shields.io/badge/E2SM--RC%20actions-28-success.svg"/>
 </p>
 
 <p align="center">
-  <img src="visualization/oran_ntn_xapp_decisions.gif" alt="9 xApps Concurrent Decisions" width="800"/>
+  <img src="docs/architecture.png" alt="oran-ntn architecture" width="900"/>
 </p>
 
-## Overview
+---
 
-This module implements the complete Space-O-RAN architecture for LEO satellite networks with:
+## Why this module
 
-- **Near-RT RIC** with E2/A1 interfaces and Shared Data Layer (SDL)
-- **Non-RT RIC** with orbit-aware A1 policy lifecycle management
-- **Space RIC** with on-board autonomous decision-making and ISL coordination
-- **9 xApps** covering handover, beam hopping, slicing, Doppler compensation, TN-NTN steering, interference management, energy harvesting, predictive allocation, and multi-connectivity
-- **5 OpenGymEnv** environments for RL-based xApp training via ns3-ai
-- **Federated Learning** coordinator with FedAvg/FedProx/FedNova aggregation
-- **Deep satellite integration** with Markov fading, DVB-S2X ModCod selection, inter-beam interference
-- **mmWave NTN PHY** with elevation-aware beamforming, NTN channel model, RTT-aware scheduler
-- **Dual Connectivity** manager for simultaneous TN + NTN bearer support
+Open-RAN deployments in non-terrestrial networks reshape Near-RT RIC operations in three concrete ways: the set of serving cells rotates on a tens-of-seconds timescale, feeder-link delay varies between gateways, and the gNB radio unit itself migrates across satellites. `oran-ntn` is a working ns-3.43 reference implementation of a **Space O-RAN** architecture in which a satellite-hosted **Space RIC** cooperates with a ground-based **Near-RT RIC** via the standard E2 and A1 interfaces, with a matching E2 service model (`E2SM-HO-PRED`) that exposes LEO-specific measurements — per-candidate SINR, elevation, Doppler, and time-to-exit (TTE).
 
-## Architecture
+## At a glance
+
+| Metric | Value |
+|---|---|
+| xApp containers shipped | **13** (HO / beam-hop / slice / Doppler / TN-NTN / energy / interference / multi-conn / predictive / ISAC / 3 × THz) |
+| E2SM-RC action types | **28** |
+| A1 policy types | **11** |
+| Conflict-resolution strategies | 5 (PRIORITY · TEMPORAL · MERGE · A1\_GUIDED · ML\_BASED) |
+| Federated aggregators | 4 (FedAvg · FedProx · FedNova · SCAFFOLD) |
+| 600-s scenario (5 live xApps) | **85 074** actions, **0** reported conflicts |
+| HO xApp Monte-Carlo (10 seeds × 600 s) | total HO 200±40 → **135±12**, ping-pong 57.1 % → **0 %** |
+
+## What it does
+
+- **Ground Near-RT RIC** + **Space RIC** (on-board, autonomous under feeder outage) — both speak standard O-RAN E2 / A1
+- 13 xApp containers inheriting from a common `OranNtnXappBase`, each with O1 KPIs (P50/P95/P99 latency, drift index, decision rate)
+- `E2SM-HO-PRED` service-model definition (ASN.1 sketch in [docs/](docs/)) — strict superset of legacy E2SM-RC HO
+- `OranNtnConflictManager` with resource-key arbitration over a sliding window
+- 4-aggregator federated-learning subsystem (FedAvg / FedProx / FedNova / SCAFFOLD), exchanged across ISL when the Space RIC takes over
+- `oran-ntn-full-scenario` reference example with 5 concurrent xApps over a 600-s LEO pass
+
+## Live demos
+
+### 66-satellite Walker-Star with Space RICs and ISL coordination
 
 <p align="center">
-  <img src="visualization/oran_ntn_architecture.png" alt="Module Architecture" width="800"/>
+  <img src="docs/oran_constellation_ric.gif" alt="Constellation + Space RIC" width="850"/>
 </p>
 
-```
-Non-RT RIC (SMO)
-    |  A1 policies (orbit-aware)
-    v
-Near-RT RIC
-    |  E2 interface (KPM reports, RC actions)
-    |  xApp conflict resolution
-    |  Shared Data Layer
-    v
-+---+---+---+---+---+---+---+---+---+
-| HO  |Beam|Slice|Dopp|Steer|Intf|Enrg|Pred|Multi|
-|Pred |Hop |Mgr  |Comp|     |Mgmt|Harv|Allc|Conn |
-+---+---+---+---+---+---+---+---+---+
-    |  OpenGymEnv (ns3-ai)
-    v
-Space RIC (on-orbit)
-    |  ISL coordination
-    |  LibTorch / Rule-based inference
-    |  Federated Learning
-    v
-Satellite Bridge
-    |  SGP4 orbit, fading, ModCod, interference
-    v
-mmWave PHY + Satellite Channel
-```
-
-## Module Structure
-
-```
-oran-ntn/
-├── model/                    # Core implementation (32 .h + 32 .cc)
-│   ├── oran-ntn-types.h                    # All data structures and enums
-│   ├── oran-ntn-e2-interface.*             # E2 KPM/RC interface
-│   ├── oran-ntn-a1-interface.*             # A1 policy management
-│   ├── oran-ntn-conflict-manager.*         # Multi-xApp conflict resolution
-│   ├── oran-ntn-xapp-base.*               # Abstract xApp base class
-│   ├── oran-ntn-near-rt-ric.*             # Near-RT RIC controller
-│   ├── oran-ntn-space-ric.*               # On-orbit Space RIC
-│   ├── oran-ntn-sat-bridge.*              # Deep satellite integration
-│   ├── oran-ntn-xapp-ho-predict.*         # HO Prediction xApp (LSTM/DQN)
-│   ├── oran-ntn-xapp-beam-hop.*           # Beam Hopping xApp
-│   ├── oran-ntn-xapp-slice-manager.*      # Network Slice Manager xApp
-│   ├── oran-ntn-xapp-doppler-comp.*       # Doppler Compensation xApp
-│   ├── oran-ntn-xapp-tn-ntn-steering.*    # TN-NTN Traffic Steering xApp
-│   ├── oran-ntn-mmwave-beamforming.*      # NTN-aware beamforming model
-│   ├── oran-ntn-channel-model.*           # Composite NTN channel model
-│   ├── oran-ntn-ntn-scheduler.*           # RTT-aware MAC scheduler
-│   ├── oran-ntn-phy-kpm-extractor.*       # Real PHY KPM extraction
-│   ├── oran-ntn-dual-connectivity.*       # TN-NTN dual connectivity
-│   ├── oran-ntn-gym-handover.*            # Gymnasium env: handover RL
-│   ├── oran-ntn-gym-beam-hop.*            # Gymnasium env: beam hopping RL
-│   ├── oran-ntn-gym-slice.*               # Gymnasium env: slice mgmt RL
-│   ├── oran-ntn-gym-steering.*            # Gymnasium env: steering RL
-│   ├── oran-ntn-gym-predictive.*          # Gymnasium env: prediction RL
-│   ├── oran-ntn-msg-interface.h           # ns3-ai shared memory structs
-│   ├── oran-ntn-federated-learning.*      # FL coordinator (FedAvg/FedProx)
-│   ├── oran-ntn-xapp-interference-mgmt.* # Interference Management xApp
-│   ├── oran-ntn-xapp-energy-harvest.*     # Energy Harvesting xApp
-│   ├── oran-ntn-xapp-predictive-alloc.*   # Predictive Allocation xApp
-│   ├── oran-ntn-xapp-multi-conn.*         # Multi-Connectivity xApp
-│   ├── oran-ntn-space-ric-inference.*     # On-board inference engine
-│   └── oran-ntn-isl-header.*             # ISL protocol header
-├── helper/
-│   └── oran-ntn-helper.*                  # Top-level scenario builder
-├── test/
-│   └── oran-ntn-test-suite.cc             # 18 unit tests
-├── examples/
-│   └── oran-ntn-full-scenario.cc          # Full constellation example
-├── tools/
-│   ├── oran_ntn_ai_agent.py               # Core AI architectures
-│   ├── oran_ntn_gym_agents.py             # Gymnasium RL agents
-│   └── oran_ntn_space_ric_agent.py        # Space RIC AI agent
-└── CMakeLists.txt
-```
-
-## Realistic NTN KPM Metrics
+### Concurrent xApp decision dashboard (HO / beam-hop / slice / Doppler / TN-NTN)
 
 <p align="center">
-  <img src="visualization/oran_ntn_kpm_metrics.png" alt="KPM Metrics" width="800"/>
+  <img src="docs/oran_xapp_decisions.gif" alt="xApp decisions" width="850"/>
 </p>
 
-## Key Features
+## Install & run
 
-### Deep Satellite Integration (Phase 1)
-- **Markov fading model**: 3-state (clear/shadow/blocked) with elevation-dependent transition probabilities
-- **DVB-S2X ModCod selection**: 28 SINR thresholds from QPSK 1/4 to 32APSK 9/10
-- **Inter-beam interference**: Intra-satellite sidelobe + inter-satellite co-channel
-- **ISL topology**: Intra-plane and inter-plane links with realistic delays
+See [**INSTALL.md**](INSTALL.md) for full setup.
 
-### mmWave NTN PHY (Phase 2)
-- **NTN beamforming**: Elevation-dependent steering, Doppler beam squint correction, predictive steering
-- **Composite channel**: FSPL + ITU-R atmospheric (P.676/P.618/P.531) + Loo fading + Markov + clutter
-- **NTN scheduler**: RTT-aware HARQ (5-40ms), beam-hopping slots, TTE-priority, slice PRB ranges
-- **Dual connectivity**: McUeNetDevice management, split bearer, primary path switching
+Quick taste:
 
-### AI/ML Integration (Phase 3)
-- **5 OpenGymEnv subclasses** with observation/action/reward definitions for each xApp
-- **ns3-ai msg-interface** structs for high-performance Space RIC inference
-- **Federated learning**: FedAvg, FedProx, FedNova with top-k gradient compression
-- **Python agents**: DQN+PER, PPO, MAPPO, LSTM architectures
+```bash
+git clone https://github.com/Muhammaduazir69/oran-ntn.git contrib/oran-ntn
+./ns3 configure --enable-examples --enable-tests
+./ns3 build
+./ns3 run "oran-ntn-full-scenario --simTime=600 --xapps=ho,beamhop,slice,doppler,tnntn"
+```
 
-### Advanced xApps (Phase 4)
-- **Interference Management**: Graph-based detection, power control, null steering, graph coloring
-- **Energy Harvesting**: Solar model, eclipse detection, battery SoC, SLA-aware beam shutdown
-- **Predictive Allocation**: LSTM traffic prediction, anomaly detection, proactive PRB reservation
-- **Multi-Connectivity**: DC activation/teardown, optimal split ratio, predictive DC
+## Documentation
 
-### Enhanced Space RIC (Phase 5)
-- **Multi-backend inference**: LibTorch -> msg-interface IPC -> rule-based fallback
-- **ISL packet exchange**: Custom 27-byte protocol header, realistic delay-based delivery
-- **Model management**: Federated learning weight distribution and version tracking
+- [INSTALL.md](INSTALL.md) — full setup + dependency notes
+- [docs/architecture.png](docs/architecture.png) — module architecture
+- Reference paper: *A Space O-RAN Architecture and E2 Service Model for Handover Prediction*, IEEE TNSM, in submission
 
-## Dependencies
+## Cite this work
 
-- ns-3.43+
-- SNS3 satellite module (contrib/satellite)
-- mmWave module (contrib/mmwave)
-- ns3-ai module (contrib/ai)
-- Boost (for ns3-ai shared memory)
-- Protobuf (for ns3-ai gym interface)
+```bibtex
+@misc{uzair2026oranntn,
+  author = {Uzair, Muhammad},
+  title  = {oran-ntn: Space O-RAN Reference Implementation for ns-3.43},
+  year   = {2026},
+  url    = {https://github.com/Muhammaduazir69/oran-ntn}
+}
+```
 
-## References
+## Part of the ns3-ntn-toolkit
 
-- O-RAN.WG3.E2SM-KPM-v03.00
-- O-RAN.WG3.E2SM-RC-v01.03
-- O-RAN.WG2.A1-v03.01
-- Space-O-RAN (IEEE CommMag 2026)
-- 3GPP TR 38.811 (NTN channel models)
-- 3GPP TS 38.821 (NTN solutions)
-- DVB-S2X (ETSI EN 302 307-2)
+This module is one of five custom modules bundled in [**ns3-ntn-toolkit**](https://github.com/Muhammaduazir69/ns3-ntn-toolkit):
 
-## Author
-
-Muhammad Uzair
+| Module | Repo |
+|---|---|
+| Toolkit (umbrella) | [ns3-ntn-toolkit](https://github.com/Muhammaduazir69/ns3-ntn-toolkit) |
+| ntn-cho | [ntn-cho-framework](https://github.com/Muhammaduazir69/ntn-cho-framework) |
+| **oran-ntn** | this repo |
+| thz-ntn | [ns3-thz-ntn](https://github.com/Muhammaduazir69/ns3-thz-ntn) |
+| ns3-ai (fork) | [ns3-ai](https://github.com/Muhammaduazir69/ns3-ai) |
 
 ## License
 
-GPL-2.0-only
+GPL-2.0-only — see [LICENSE](LICENSE).
+
+## Acknowledgements
+
+ns-3 core team · SNS3 maintainers · O-RAN Alliance WG3 / WG2 specifications.
