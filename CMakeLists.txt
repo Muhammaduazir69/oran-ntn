@@ -36,6 +36,7 @@ set(source_files
     model/oran-ntn-isl-header.cc
     # Helper
     helper/oran-ntn-helper.cc
+    helper/ntn-realistic-traffic-helper.cc
 )
 
 set(header_files
@@ -78,6 +79,7 @@ set(header_files
     model/oran-ntn-isl-header.h
     # Helper
     helper/oran-ntn-helper.h
+    helper/ntn-realistic-traffic-helper.h
 )
 
 set(test_sources

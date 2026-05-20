@@ -13,4 +13,5 @@ build_lib_example(
     ${libsatellite}
     ${libmmwave}
     ${liblte}
+    ${libpoint-to-point}
 )
