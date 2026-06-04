@@ -1,6 +1,6 @@
 <h1 align="center">oran-ntn</h1>
 
-<p align="center"><strong>Space O-RAN reference implementation for ns-3.43 — 13 xApps, 28 E2SM-RC actions, 11 A1 policies, 5 conflict strategies, 4 federated aggregators</strong></p>
+<p align="center"><strong>Space O-RAN reference implementation for ns-3.43 — 13 xApps, 29 E2SM-RC actions, 11 A1 policies, 5 conflict strategies, 4 federated aggregators</strong></p>
 
 <p align="center">
   <a href="https://www.nsnam.org"><img src="https://img.shields.io/badge/ns--3-3.43-blue.svg"/></a>
@@ -40,6 +40,7 @@ Open-RAN deployments in non-terrestrial networks reshape Near-RT RIC operations 
 - `OranNtnConflictManager` with resource-key arbitration over a sliding window
 - 4-aggregator federated-learning subsystem (FedAvg / FedProx / FedNova / SCAFFOLD), exchanged across ISL when the Space RIC takes over
 - `oran-ntn-full-scenario` reference example with 5 concurrent xApps over a 600-s LEO pass
+- `oran-ntn-ric-controlled-traffic` example where RIC control actions steer a real UDP flow
 
 ## Live demos
 
@@ -65,7 +66,7 @@ Quick taste:
 git clone https://github.com/Muhammaduazir69/oran-ntn.git contrib/oran-ntn
 ./ns3 configure --enable-examples --enable-tests
 ./ns3 build
-./ns3 run "oran-ntn-full-scenario --simTime=600 --xapps=ho,beamhop,slice,doppler,tnntn"
+./ns3 run "oran-ntn-full-scenario --duration=600 --numUes=20 --outputDir=results/"
 ```
 
 ## Documentation

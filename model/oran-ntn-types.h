@@ -99,6 +99,20 @@ struct E2KpmReport
     double batteryStateOfCharge;       //!< Satellite battery SoC (0-1)
     double solarPower_W;               //!< Current solar panel output
     bool inEclipse;                    //!< Satellite in Earth shadow
+
+    // === THz-NTN metrics (Phase 5: THz integration) ===
+    double thzCenterFreq_GHz;              //!< Operating THz frequency
+    double molecularAbsorption_dB;         //!< Current molecular absorption loss
+    double pointingError_deg;              //!< Beam pointing error
+    double thzSnr_dB;                      //!< THz link SNR
+    uint16_t umMimoElements;               //!< Active UM-MIMO elements
+    double risGain_dB;                     //!< RIS-assisted gain
+    double hardwareImpairmentLoss_dB;      //!< PA + phase noise + ADC losses
+    double atmosphericWindow_GHz;          //!< Current atmospheric window center
+    bool isacSensingActive;                //!< ISAC mode flag
+    double debrisDetectionRange_km;        //!< ISAC debris detection range
+    double beamSquintLoss_dB;              //!< Wideband beam squint loss
+    std::string activeWaveform;            //!< Current waveform (OFDM/OTFS/AFDM/etc)
 };
 
 // ============================================================================
@@ -132,6 +146,13 @@ enum class E2RcActionType : uint8_t
     PRB_RESERVATION = 19,          //!< Proactive PRB reservation from traffic prediction
     FL_MODEL_PUSH = 20,            //!< Push federated learning model update
     ENERGY_PROFILE_UPDATE = 21,    //!< Update satellite energy profile/mode
+    ACTION_THZ_FREQ_SELECT = 22,        //!< Switch THz operating band
+    ACTION_THZ_BEAM_CODEBOOK = 23,      //!< Update beam codebook
+    ACTION_THZ_RIS_CONFIG = 24,         //!< Configure RIS phase profile
+    ACTION_THZ_WAVEFORM_SELECT = 25,    //!< Switch waveform (OFDM/OTFS/AFDM)
+    ACTION_THZ_ISAC_MODE = 26,         //!< Enable/disable ISAC sensing
+    ACTION_THZ_POWER_BACKOFF = 27,     //!< PA backoff for linearity
+    ACTION_THZ_WINDOW_HOP = 28,        //!< Hop to different atmospheric window
 };
 
 /**
@@ -197,6 +218,40 @@ struct A1Policy
 // ============================================================================
 
 /**
+ * \brief WG3-aligned conflict taxonomy (Roadmap §4.1.10).
+ *
+ * Per O-RAN.WG3 conflict-mitigation terminology three categories matter:
+ *   - DIRECT   two xApps target the same parameter on the same UE/cell
+ *   - INDIRECT two xApps target different parameters but in the same
+ *              resource family on the same gNB (e.g. PRB reservation vs
+ *              slice PRB share)
+ *   - IMPLICIT actions are coupled through a shared KPI; here flagged
+ *              when both target the same UE but the action types and
+ *              resource families differ
+ *   - UNKNOWN  classifier could not place the pair (kept so non-WG3
+ *              conflicts still log without losing taxonomy)
+ */
+enum class ConflictType : uint8_t
+{
+    UNKNOWN = 0,
+    DIRECT = 1,
+    INDIRECT = 2,
+    IMPLICIT = 3,
+};
+
+inline const char*
+ConflictTypeName(ConflictType c)
+{
+    switch (c)
+    {
+    case ConflictType::DIRECT:   return "direct";
+    case ConflictType::INDIRECT: return "indirect";
+    case ConflictType::IMPLICIT: return "implicit";
+    default:                     return "unknown";
+    }
+}
+
+/**
  * \brief Record of a conflict between two xApps
  */
 struct XappConflict
@@ -210,6 +265,7 @@ struct XappConflict
     uint32_t resourceId;           //!< Which specific resource
     std::string resolution;        //!< "priority", "merge", "reject_lower"
     uint32_t winnerId;             //!< Which xApp's action was executed
+    ConflictType conflictType{ConflictType::UNKNOWN}; //!< WG3 taxonomy (Roadmap §4.1.10)
 };
 
 // ============================================================================
