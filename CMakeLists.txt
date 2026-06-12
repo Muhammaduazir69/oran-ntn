@@ -68,9 +68,16 @@ set(source_files
     model/oran-ntn-xapp-thz-spectrum.cc
     model/oran-ntn-xapp-thz-ris.cc
     model/oran-ntn-xapp-isac.cc
+    # WS3 — multi-tier RIC + cross-domain SMO + ONNX inference (AI-Native plan)
+    model/oran-ntn-rt-ric.cc
+    model/oran-ntn-ric-placement.cc
+    model/oran-ntn-cross-domain.cc
+    model/oran-ntn-onnx-xapp.cc
+    # WS4 — payload options / FH split / platform spec / role switch
+    model/oran-ntn-fh-split.cc
+    model/ntn-platform-spec.cc
     # Helper
     helper/oran-ntn-helper.cc
-    helper/ntn-realistic-traffic-helper.cc
 )
 
 set(header_files
@@ -147,13 +154,22 @@ set(header_files
     model/oran-ntn-xapp-thz-spectrum.h
     model/oran-ntn-xapp-thz-ris.h
     model/oran-ntn-xapp-isac.h
+    # WS3 — multi-tier RIC + cross-domain SMO + ONNX inference (AI-Native plan)
+    model/oran-ntn-rt-ric.h
+    model/oran-ntn-ric-placement.h
+    model/oran-ntn-cross-domain.h
+    model/oran-ntn-onnx-xapp.h
+    # WS4 — payload options / FH split / platform spec / role switch
+    model/oran-ntn-fh-split.h
+    model/ntn-platform-spec.h
     # Helper
     helper/oran-ntn-helper.h
-    helper/ntn-realistic-traffic-helper.h
 )
 
 set(test_sources
     test/oran-ntn-test-suite.cc
+    test/oran-ntn-multi-tier-ric-test.cc
+    test/oran-ntn-ws4-test.cc
 )
 
 set(oran_ntn_extra_libs "")
@@ -166,12 +182,19 @@ find_library(SCTP_LIB sctp)
 if(SCTP_LIB)
     list(APPEND oran_ntn_extra_libs ${SCTP_LIB})
 endif()
-
-# ns3-ai: accept the upstream module (libns3-ai) or the toolkit fork
-# (libns3-ai-ntn), whichever is present in the enclosing ns-3 tree.
-set(oran_ntn_ai_lib ${oran_ntn_ai_lib})
-if(TARGET ${libns3-ai})
-  set(oran_ntn_ai_lib ${libns3-ai})
+# WS3 — optional ONNX Runtime for OranNtnOnnxXapp (MIT; graceful fallback to
+# the registered heuristic when absent). Mirrors ns3-ai-ntn's libtensorflow
+# auto-detect pattern.
+find_path(ONNXRUNTIME_INCLUDE_DIR onnxruntime_cxx_api.h
+          PATH_SUFFIXES onnxruntime onnxruntime/core/session)
+find_library(ONNXRUNTIME_LIB onnxruntime)
+if(ONNXRUNTIME_INCLUDE_DIR AND ONNXRUNTIME_LIB)
+    message(STATUS "ONNX Runtime found; OranNtnOnnxXapp real inference enabled")
+    add_definitions(-DHAVE_ONNXRUNTIME)
+    include_directories(${ONNXRUNTIME_INCLUDE_DIR})
+    list(APPEND oran_ntn_extra_libs ${ONNXRUNTIME_LIB})
+else()
+    message(STATUS "ONNX Runtime not found; OranNtnOnnxXapp uses heuristic fallback")
 endif()
 
 build_lib(
@@ -188,7 +211,8 @@ build_lib(
         ${libapplications}
         ${libsatellite}
         ${libmmwave}
-        ${oran_ntn_ai_lib}
+        ${libns3-ai-ntn}
+        ${libntn-traffic}
         ${oran_ntn_extra_libs}
     TEST_SOURCES ${test_sources}
 )

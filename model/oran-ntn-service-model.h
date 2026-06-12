@@ -5,7 +5,7 @@
 #ifndef ORAN_NTN_SERVICE_MODEL_H
 #define ORAN_NTN_SERVICE_MODEL_H
 
-// Service-Model plugin ABI (Realism-Adoption-Roadmap-2026 §3 T4).
+// Service-Model plugin ABI (2026 realism roadmap §3 T4).
 //
 // Every Service Model the toolkit ships — KPM v3, RC v1.03 (with Style 3
 // Connected-Mode Mobility from 4.1.3), E2SM-CCC, NTN-Ephemeris-SM, THz-RIS-SM
@@ -41,6 +41,10 @@ namespace ns3
  *   - OranNtnServiceModelCcc  E2SM-CCC (planned, 4.1.8)
  *   - OranNtnServiceModelNtnEphemeris (planned, 4.1.7)
  *   - OranNtnServiceModelThzRis (planned, 4.3.6)
+ *
+ * \note The service-model plugin ABI is currently exercised by unit tests
+ *       only; the in-sim E2 path (OranNtnE2Node) delivers structs directly
+ *       and does not serialize through these plugins yet.
  */
 class OranNtnServiceModel : public Object
 {
@@ -82,6 +86,8 @@ class OranNtnServiceModel : public Object
  * One instance per Near-RT RIC. xApps consult `Lookup(RicFunctionId)` at
  * subscription time to find the encoder/decoder for the SM they want to
  * speak.
+ *
+ * \note Currently exercised by unit tests only.
  */
 class OranNtnServiceModelRegistry : public Object
 {

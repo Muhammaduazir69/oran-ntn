@@ -1,8 +1,15 @@
 # Install & run — oran-ntn
 
-This guide walks you through installing the `oran-ntn` Space O-RAN reference module on top of the
-[ns3-ntn-toolkit](https://github.com/Muhammaduazir69/ns3-ntn-toolkit)
-or any vanilla ns-3.43 tree with `satellite`, `mmwave`, and (optionally) `ai`.
+This guide walks you through installing the `oran-ntn` Space O-RAN reference module.
+The **recommended** way is to install it inside the
+[ns3-ntn-toolkit](https://github.com/Muhammaduazir69/ns3-ntn-toolkit) tree, where every
+dependency is already present. Since v2.1 the module and its examples depend on the
+toolkit's `ntn-traffic` module (`NtnRealStackHelper`, `NtnOranApplication`/`NtnOranApplicationSink`,
+`NtnOranAiFlowMonitor`) and `ntn-constellation` module (`Sgp4MobilityModel`,
+`WalkerConstellation`) — so a vanilla ns-3.43 tree works only if you also add the
+toolkit's `ntn-traffic`, `ntn-constellation`, `ntn-cho`, `satellite`, and `mmwave`
+modules. ONNX Runtime is optional (CMake auto-detects it for the ONNX xApp; without
+it the xApp falls back to the registered heuristic).
 
 ---
 
@@ -21,32 +28,45 @@ or any vanilla ns-3.43 tree with `satellite`, `mmwave`, and (optionally) `ai`.
 
 ## 2. Prerequisites
 
-### 2a. ns-3.43 tree
+### 2a. ns3-ntn-toolkit tree (RECOMMENDED)
 
-Easiest:
+Easiest — all required sibling modules ship in `contrib/` already:
 
 ```bash
 git clone https://github.com/Muhammaduazir69/ns3-ntn-toolkit.git
 cd ns3-ntn-toolkit
 ```
 
-### 2b. SNS3 satellite (REQUIRED)
+If you take this route, skip straight to section 3.
+
+### 2b. Vanilla ns-3.43: required toolkit modules
+
+On a plain ns-3.43 tree you must add **all** of the following to `contrib/`
+before `oran-ntn` will configure:
 
 ```bash
 cd contrib/
+# Toolkit modules (v2.1 hard dependencies of oran-ntn and its examples):
+#   ntn-traffic        — NtnRealStackHelper, NtnOranApplication/Sink, NtnOranAiFlowMonitor
+#   ntn-constellation  — Sgp4MobilityModel, WalkerConstellation
+#   ntn-cho            — TTE-aware CHO used by the example scenarios
+git clone https://github.com/Muhammaduazir69/ns3-ntn-toolkit.git /tmp/ns3-ntn-toolkit
+cp -r /tmp/ns3-ntn-toolkit/contrib/ntn-traffic .
+cp -r /tmp/ns3-ntn-toolkit/contrib/ntn-constellation .
+cp -r /tmp/ns3-ntn-toolkit/contrib/ntn-cho .
+# SNS3 satellite (REQUIRED):
 git clone https://github.com/sns3/sns3-satellite.git satellite
+# mmWave NR PHY (REQUIRED):
+git clone https://github.com/nyuwireless-unipd/ns3-mmwave.git mmwave
 cd ..
 ```
 
-### 2c. mmWave (REQUIRED for NR PHY)
+### 2c. ONNX Runtime (OPTIONAL, only for the ONNX xApp)
 
-If not already in your tree:
-
-```bash
-cd contrib/
-git clone https://gitlab.com/cttc-lena/nr.git mmwave
-cd ..
-```
+`OranNtnOnnxXapp` runs real inference when ONNX Runtime is installed; CMake
+auto-detects it (`find_library(onnxruntime)`) and defines `HAVE_ONNXRUNTIME`.
+Without it the build still succeeds and the xApp falls back to the registered
+heuristic.
 
 ### 2d. ns3-ai fork (OPTIONAL, only for RL-driven xApps)
 
@@ -135,7 +155,7 @@ The agent uses the 68-feature observation exposed by the `ntn-cho` module via th
 ## 7. Common issues
 
 **`oran-ntn not found` after configure**
-You're missing one of the dependencies. Verify all of `satellite`, `mmwave` are present in `contrib/`.
+You're missing one of the dependencies. Verify all of `ntn-traffic`, `ntn-constellation`, `ntn-cho`, `satellite`, `mmwave` are present in `contrib/`.
 
 **Build cache filtering modules**
 Run a clean configure:

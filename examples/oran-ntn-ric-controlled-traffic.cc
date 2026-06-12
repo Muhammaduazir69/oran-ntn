@@ -3,42 +3,61 @@
 // SPDX-License-Identifier: GPL-2.0-only
 //
 // oran-ntn-ric-controlled-traffic — a closed O-RAN control loop steering a
-// REAL LEO downlink:
+// REAL LEO downlink on a REAL mmwave NR NTN cell (NtnRealStackHelper):
 //
-//   data plane:   satellite --(P2P + geometry error model)--> UE  (real UDP)
-//   telemetry:    OranNtnE2Node reports E2-KPM (SINR) each period
-//   control:      an mMIMO-precoder xApp consumes each KPM indication; when
-//                 the reported SINR drops below a threshold it engages
-//                 beamforming (selects a beam from an OranNtnMmimoCodebook and
-//                 applies the 10*log10(N_tx) array gain), which raises the
-//                 link EIRP and therefore the delivered throughput.
+//   data plane:   saturating downlink over the real radio (SpectrumPhy + MAC +
+//                 RLC/PDCP + RRC + EPC); KPIs MEASURED off the PHY trace.
+//   telemetry:    OranNtnE2Node reports E2-KPM each second; the reported SINR
+//                 is the INTRINSIC link quality (measured minus the RIC's own
+//                 beam gain) so the xApp's decision tracks the channel, not
+//                 its own actuation.
+//   control:      the mMIMO-precoder xApp consumes each KPM indication; when
+//                 intrinsic SINR < threshold it selects a beam from the
+//                 OranNtnMmimoCodebook and issues an E2SM-RC BEAM_SWITCH
+//                 action back through the E2 node (ReceiveRcAction). The
+//                 action lands as a LIVE channel reconfiguration — real
+//                 packets feel the beam, so MEASURED SINR/TBLER/goodput
+//                 recover.
 //
-// So the RIC control action has a measurable effect on the real data plane:
-// during the low-elevation part of the pass the xApp turns the beam on and
-// the goodput recovers; at high elevation the beam is not needed. Compare
-// --xapp=true vs --xapp=false. Nothing is hardcoded — the beam decision comes
-// from the live KPM telemetry.
+// Loop timing (audit fix 2026-06-12, issue #12): both legs of the loop are
+// delay-modeled — the KPM indication crosses one feeder-link delay uplink and
+// is dispatched only on the next Near-RT RIC control-loop tick
+// (AlignToControlLoop=true, 100 ms period), and the RC action crosses one
+// feeder-link delay downlink before it actuates. So the modeled loop is
+// measure -> feeder -> loop tick -> feeder -> apply, not the optimistic
+// inline execution. E2AP-over-SCTP itself is NOT simulated (same substitution
+// as ns-3 mainline S1/X2; see oran-ntn-e2-interface.h).
 //
-// Quick test:  --simSeconds=120 --dataRateMbps=5
-#include "ns3/applications-module.h"
-#include "ns3/command-line.h"
-#include "ns3/constant-position-mobility-model.h"
-#include "ns3/constant-velocity-mobility-model.h"
+// Beam state is scoped PER CELL (keyed by E2 cellId), so copy-pasting this
+// pattern into a multi-satellite scenario cannot bleed beam gain across
+// satellites.
+//
+// Audit fix (AI-Native ORAN-NTN adoption WS0): previously the KPM SINR
+// was a closed-form FSPL budget and the data plane a P2P RateErrorModel behind
+// a sigmoid SnrToPer() — now both halves of the loop ride the measured radio.
+// Mobility is real: SGP4 Walker element (ENU-projected), fixed ground UE.
+//
+// Compare --xapp=1 vs --xapp=0: without the xApp the marginal Ka link stays
+// degraded for the whole pass.
+//
+// Quick test:  --simSeconds=40 --xapp=1
 #include "ns3/core-module.h"
-#include "ns3/error-model.h"
-#include "ns3/flow-monitor-helper.h"
-#include "ns3/internet-stack-helper.h"
-#include "ns3/ipv4-address-helper.h"
-#include "ns3/point-to-point-channel.h"
-#include "ns3/point-to-point-helper.h"
-
+#include "ns3/mobility-module.h"
+#include "ns3/network-module.h"
+#include "ns3/ntn-real-stack-helper.h"
+#include "ns3/ntn-static-extra-loss-model.h"
+#include "ns3/ntn-tr38811-mobility-model.h"
 #include "ns3/oran-ntn-e2-interface.h"
 #include "ns3/oran-ntn-mmimo-codebook.h"
 #include "ns3/oran-ntn-types.h"
+#include "ns3/sgp4-mobility-model.h"
+#include "ns3/walker-constellation.h"
 
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <map>
+#include <string>
 #include <vector>
 
 using namespace ns3;
@@ -47,186 +66,233 @@ NS_LOG_COMPONENT_DEFINE("OranNtnRicControlledTraffic");
 
 namespace
 {
-constexpr double kC = 299792458.0;
 
-Ptr<MobilityModel> g_ue, g_sat;
+constexpr uint32_t kCellId = 7; //!< E2 node id of the (single) satellite gNB
+
+NtnRealStackHelper* g_rs = nullptr;
 Ptr<OranNtnE2Node> g_e2;
 Ptr<OranNtnMmimoCodebook> g_codebook;
-Ptr<RateErrorModel> g_em;
-Ptr<PointToPointChannel> g_channel;
-Ptr<PacketSink> g_sink;
-uint64_t g_lastRx = 0;
-double g_baseEirpDbm = 62.0;
-double g_freqHz = 20.0e9;
-double g_noiseDbm = -95.0;
-double g_minElev = 10.0;
-double g_sinrThreshDb = 12.0; // xApp engages the beam below this
+
+/// RIC-commanded beam state of ONE cell. Keeping this per cell (instead of
+/// file-scope globals) means a multi-satellite copy of this example cannot
+/// bleed beam gain from one satellite into another.
+struct CellBeamState
+{
+    Ptr<NtnStaticExtraLossModel> model; //!< negative loss = commanded array gain
+    double gainDb{0.0};                 //!< current RIC-commanded beam gain
+    bool on{false};
+    uint32_t activations{0};
+};
+
+std::map<uint32_t, CellBeamState> g_beams; //!< keyed by E2 cellId
+
+double g_sinrThreshDb = 12.0; // xApp engages the beam below this (intrinsic)
 bool g_xappEnabled = true;
-double g_beamGainDb = 0.0;    // current RIC-commanded beamforming gain
 uint32_t g_numTx = 64;
-uint32_t g_beamActivations = 0;
-bool g_beamOn = false;
 
-double
-Dist(const Vector& a, const Vector& b)
+void
+ApplyBeamState(uint32_t cellId)
 {
-    const double dx = a.x - b.x, dy = a.y - b.y, dz = a.z - b.z;
-    return std::sqrt(dx * dx + dy * dy + dz * dz);
+    auto it = g_beams.find(cellId);
+    if (it == g_beams.end())
+    {
+        return;
+    }
+    const CellBeamState& st = it->second;
+    const double gain = st.on ? st.gainDb : 0.0;
+    st.model->SetFloorDb(-gain);
+    st.model->SetLossDb(-gain);
 }
 
-double
-ElevDeg(const Vector& u, const Vector& s)
+// RC action handler on the E2 node: executes the xApp's BEAM_SWITCH command
+// (after the return feeder delay) as a live channel reconfiguration of the
+// TARGETED cell only. parameter1 > 0 engages that beam gain; 0 disengages.
+bool
+ApplyBeamRcAction(E2RcAction action)
 {
-    const Vector d(s.x - u.x, s.y - u.y, s.z - u.z);
-    return std::atan2(d.z, std::max(std::sqrt(d.x * d.x + d.y * d.y), 1e-3)) *
-           180.0 / M_PI;
+    auto it = g_beams.find(action.targetGnbId);
+    if (it == g_beams.end())
+    {
+        return false;
+    }
+    CellBeamState& st = it->second;
+    if (action.parameter1 > 0.0)
+    {
+        st.gainDb = action.parameter1;
+        if (!st.on)
+        {
+            ++st.activations;
+        }
+        st.on = true;
+    }
+    else
+    {
+        st.on = false;
+    }
+    ApplyBeamState(action.targetGnbId);
+    return true;
 }
 
-double
-FsplDb(double dM, double fHz)
-{
-    return 20.0 * std::log10(std::max(dM, 1.0)) +
-           20.0 * std::log10(fHz / 1e9) + 32.45;
-}
-
-double
-SnrToPer(double snrDb)
-{
-    return 1.0 / (1.0 + std::exp(0.8 * (snrDb - 6.0)));
-}
-
-// The xApp: invoked on every E2-KPM indication from the satellite gNB.
-// Implements the §4.1.12 mMIMO precoder control — engage beamforming when
-// the link SINR is below target.
+// The xApp: invoked on every E2-KPM indication (dispatched on the RIC
+// control-loop tick, one feeder delay after the measurement was taken).
+// §4.1.12 mMIMO precoder control — engage beamforming when the intrinsic
+// link SINR is below target. The decision is NOT applied inline: it is sent
+// back through OranNtnE2Node::ReceiveRcAction, which delivers it after the
+// return-path feeder delay.
 void
 PrecoderXapp(E2Indication ind)
 {
-    const double sinr = ind.kpmReport.sinr_dB;
     if (!g_xappEnabled)
     {
-        g_beamGainDb = 0.0;
-        g_beamOn = false;
+        return; // beam starts (and stays) disengaged
+    }
+    const uint32_t cellId = ind.kpmReport.gnbId;
+    auto it = g_beams.find(cellId);
+    if (it == g_beams.end())
+    {
         return;
     }
+    const double sinr = ind.kpmReport.sinr_dB; // intrinsic (see KPM tick)
+
+    E2RcAction action{};
+    action.timestamp = Simulator::Now().GetSeconds();
+    action.xappId = 1;
+    action.xappName = "mmimo-precoder";
+    action.actionType = E2RcActionType::BEAM_SWITCH;
+    action.targetGnbId = cellId;
+    action.targetBeamId = 1;
+    action.confidence = 1.0;
+
     if (sinr < g_sinrThreshDb)
     {
         // Build a broadside steering target and pick the nearest codebook
-        // beam (exercises the codebook); apply its array gain.
+        // beam (exercises the codebook); command its array gain.
         std::vector<float> target(g_numTx * 2, 0.0f);
         for (uint32_t i = 0; i < g_numTx; ++i)
         {
             target[2 * i] = 1.0f; // real part = 1 (broadside), im = 0
         }
         (void)g_codebook->BestMatch(target);
-        const double newGain = 10.0 * std::log10(static_cast<double>(g_numTx));
-        if (!g_beamOn)
-        {
-            ++g_beamActivations;
-        }
-        g_beamGainDb = newGain;
-        g_beamOn = true;
+        action.parameter1 = 10.0 * std::log10(static_cast<double>(g_numTx));
+        g_e2->ReceiveRcAction(action); // executes after the return feeder delay
     }
-    else
+    else if (it->second.on)
     {
-        g_beamGainDb = 0.0;
-        g_beamOn = false;
+        action.parameter1 = 0.0; // disengage
+        g_e2->ReceiveRcAction(action);
     }
 }
 
-void
-Tick()
+double
+ElevDegEnu(const Vector& gnd, const Vector& sat)
 {
-    const Vector u = g_ue->GetPosition();
-    const Vector s = g_sat->GetPosition();
-    const double elev = ElevDeg(u, s);
-    const double range = Dist(u, s);
-
-    // Baseline (pre-control) SINR — this is what the E2-KPM reports.
-    const double baseSinr = (g_baseEirpDbm - FsplDb(range, g_freqHz)) - g_noiseDbm;
-
-    // Submit an E2-KPM report; the xApp (indication callback) reacts and may
-    // set g_beamGainDb.
-    E2KpmReport r{};
-    r.timestamp = Simulator::Now().GetSeconds();
-    r.gnbId = g_e2->GetNodeId();
-    r.isNtn = true;
-    r.ueId = 1;
-    r.sinr_dB = baseSinr;
-    r.elevation_deg = elev;
-    g_e2->SubmitKpmMeasurement(r);
-
-    // Effective SINR after the RIC-commanded beamforming gain.
-    const double effSinr = baseSinr + g_beamGainDb;
-    const double per = (elev < g_minElev) ? 1.0 : SnrToPer(effSinr);
-    g_em->SetRate(per);
-    g_channel->SetAttribute("Delay", TimeValue(Seconds(range / kC)));
-
-    const uint64_t tot = g_sink ? g_sink->GetTotalRx() : 0;
-    const double mbps = (tot - g_lastRx) * 8.0 / 1e6;
-    g_lastRx = tot;
-    std::printf("  %6.1f  elev=%6.1f  baseSinr=%6.1f  beam=%-3s(%4.1fdB)  "
-                "effSinr=%6.1f  goodput=%8.3f\n",
-                Simulator::Now().GetSeconds(), elev, baseSinr,
-                g_beamOn ? "ON" : "off", g_beamGainDb, effSinr, mbps);
-    Simulator::Schedule(Seconds(1.0), &Tick);
+    const double dx = sat.x - gnd.x;
+    const double dy = sat.y - gnd.y;
+    const double dz = sat.z - gnd.z;
+    const double horiz = std::max(std::sqrt(dx * dx + dy * dy), 1e-3);
+    return std::atan2(dz, horiz) * 180.0 / M_PI;
 }
+
 } // namespace
 
 int
 main(int argc, char* argv[])
 {
-    double simSeconds = 120.0;
+    double simSeconds = 40.0;
     double leoAltKm = 1200.0;
-    double satSpeed = 7000.0;
-    double freqGHz = 20.0;
-    double dataRateMbps = 5.0;
-    uint32_t packetBytes = 1200;
-    double baseEirpDbm = 90.0; // marginal (SINR < threshold) without the beam
+    double freqGHz = 20.0;    // Ka-band
+    double satEirpDbm = 70.0; // marginal without the beam (below threshold)
     uint32_t numTx = 64;
     double sinrThreshDb = 12.0;
     bool xappEnabled = true;
-    double linkCapacityMbps = 50.0;
+    std::string outputDir = "oran-ntn-ric-controlled-output";
 
     CommandLine cmd(__FILE__);
     cmd.AddValue("simSeconds", "Simulation duration (s)", simSeconds);
     cmd.AddValue("leoAltKm", "Satellite altitude (km)", leoAltKm);
-    cmd.AddValue("satSpeed", "LEO ground-track speed (m/s)", satSpeed);
     cmd.AddValue("freqGHz", "Carrier frequency (GHz)", freqGHz);
-    cmd.AddValue("dataRateMbps", "Offered downlink load (Mbps)", dataRateMbps);
-    cmd.AddValue("packetBytes", "UDP payload size (bytes)", packetBytes);
-    cmd.AddValue("baseEirpDbm", "Baseline EIRP without beamforming (dBm)", baseEirpDbm);
+    cmd.AddValue("satEirpDbm", "Baseline EIRP without beamforming (dBm)", satEirpDbm);
     cmd.AddValue("numTx", "mMIMO Tx antennas (beam gain = 10log10(numTx))", numTx);
-    cmd.AddValue("sinrThreshDb", "SINR threshold below which the xApp beamforms", sinrThreshDb);
+    cmd.AddValue("sinrThreshDb", "Intrinsic SINR threshold for the xApp", sinrThreshDb);
     cmd.AddValue("xapp", "Enable the mMIMO precoder xApp control loop", xappEnabled);
-    cmd.AddValue("linkCapacityMbps", "P2P link capacity (Mbps)", linkCapacityMbps);
+    cmd.AddValue("outputDir", "Output directory", outputDir);
     cmd.Parse(argc, argv);
 
-    g_baseEirpDbm = baseEirpDbm;
-    g_freqHz = freqGHz * 1e9;
     g_sinrThreshDb = sinrThreshDb;
     g_xappEnabled = xappEnabled;
     g_numTx = numTx;
 
-    NodeContainer nodes;
-    nodes.Create(2); // 0=UE 1=sat
-    Ptr<ConstantPositionMobilityModel> ue =
-        CreateObject<ConstantPositionMobilityModel>();
-    ue->SetPosition(Vector(0, 0, 0));
-    nodes.Get(0)->AggregateObject(ue);
-    g_ue = ue;
-    Ptr<ConstantVelocityMobilityModel> sat =
-        CreateObject<ConstantVelocityMobilityModel>();
-    // Start at low elevation (far behind) so the early pass is SINR-limited.
-    sat->SetPosition(Vector(-0.45 * satSpeed * simSeconds, 0, leoAltKm * 1000.0));
-    sat->SetVelocity(Vector(satSpeed, 0, 0));
-    nodes.Get(1)->AggregateObject(sat);
-    g_sat = sat;
+    std::printf("# oran-ntn-ric-controlled-traffic (E2-KPM -> mMIMO precoder xApp -> RC "
+                "BEAM_SWITCH -> beam, measured radio)\n");
+    std::printf("#   sim=%.0fs alt=%.0fkm freq=%.0fGHz baseEIRP=%.0fdBm numTx=%u "
+                "(beamGain=%.1fdB) xApp=%s thresh=%.0fdB\n",
+                simSeconds, leoAltKm, freqGHz, satEirpDbm, numTx,
+                10.0 * std::log10(static_cast<double>(numTx)),
+                xappEnabled ? "on" : "off", sinrThreshDb);
 
-    // O-RAN E2 node on the satellite gNB + KPM subscription.
+    NodeContainer satNodes;
+    satNodes.Create(1);
+    NodeContainer ueNodes;
+    ueNodes.Create(1);
+
+    // Real SGP4 orbit projected into the local ENU frame: the serving Walker
+    // element is at zenith at t=0 and recedes with genuine orbital dynamics.
+    ns3::ntncon::WalkerConfig wcfg;
+    wcfg.num_planes = 1;
+    wcfg.total_sats = 80;
+    wcfg.altitude_km = leoAltKm;
+    wcfg.inclination_deg = 53.0;
+    wcfg.epoch_unix_s = 1735689600.0;
+    const auto elements = ns3::ntncon::WalkerConstellation::BuildDelta(wcfg);
+    Ptr<ns3::ntncon::Sgp4MobilityModel> satSgp4 =
+        CreateObject<ns3::ntncon::Sgp4MobilityModel>();
+    satSgp4->SetElements(elements[0]);
+    double subLat, subLon, subAlt;
+    satSgp4->GetGeodetic(subLat, subLon, subAlt);
+    Ptr<NtnEnuProjectionMobilityModel> satEnu = CreateObject<NtnEnuProjectionMobilityModel>();
+    satEnu->SetSource(satSgp4);
+    satEnu->SetReference(subLat, subLon, 0.0);
+    satNodes.Get(0)->AggregateObject(satEnu);
+
+    MobilityHelper mob;
+    mob.SetMobilityModel("ns3::ConstantPositionMobilityModel");
+    Ptr<ListPositionAllocator> uePos = CreateObject<ListPositionAllocator>();
+    uePos->Add(Vector(0.0, 0.0, 1.5));
+    mob.SetPositionAllocator(uePos);
+    mob.Install(ueNodes);
+
+    NtnRealStackHelper rs;
+    rs.SetSimTime(Seconds(simSeconds));
+    rs.SetOutputDir(outputDir);
+    rs.SetRunTag("oran-ntn-ric-controlled-traffic");
+    rs.SetCarrierFrequencyHz(freqGHz * 1e9);
+    rs.SetSatEirpDbm(satEirpDbm);
+    rs.Build(satNodes, ueNodes);
+    g_rs = &rs;
+
+    // The RIC-commanded beam as a LIVE channel reconfiguration (negative loss
+    // = array gain) chained onto the real spectrum channel — one beam state
+    // per cell, keyed by the cell's E2 node id.
+    CellBeamState beam;
+    beam.model = CreateObject<NtnStaticExtraLossModel>();
+    beam.model->SetLossDb(0.0);
+    rs.AddExtraPropagationLoss(beam.model);
+    g_beams[kCellId] = beam;
+
+    rs.InstallTraffic(NtnRealStackHelper::TrafficProfile::EmbbStreaming,
+                      Seconds(1.0), Seconds(simSeconds - 0.5));
+
+    // O-RAN E2 node on the satellite gNB + KPM subscription. Loop timing is
+    // honest (audit issue #12): one feeder delay per direction, and the
+    // indication is dispatched to the xApp only on the next 100 ms RIC
+    // control-loop tick (AlignToControlLoop) — E2AP/SCTP not simulated.
     g_e2 = CreateObject<OranNtnE2Node>();
-    g_e2->SetNodeId(7);
+    g_e2->SetNodeId(kCellId);
     g_e2->SetIsNtn(true);
+    g_e2->SetAttribute("FeederLinkDelay", TimeValue(MilliSeconds(4))); // ~1200 km
+    g_e2->SetAttribute("AlignToControlLoop", BooleanValue(true));
     g_e2->RegisterRanFunction(2, "E2SM-KPM v03.00");
+    g_e2->RegisterRanFunction(3, "E2SM-RC v01.03");
     E2Subscription sub{};
     sub.subscriptionId = 1;
     sub.ranFunctionId = 2;
@@ -234,78 +300,70 @@ main(int argc, char* argv[])
     sub.eventTrigger = false;
     g_e2->HandleSubscriptionRequest(sub);
     g_e2->SetIndicationCallback(MakeCallback(&PrecoderXapp));
+    g_e2->SetRcActionCallback(MakeCallback(&ApplyBeamRcAction));
+    {
+        TimeValue feeder;
+        TimeValue loop;
+        g_e2->GetAttribute("FeederLinkDelay", feeder);
+        g_e2->GetAttribute("ControlLoopPeriod", loop);
+        std::printf("# E2 loop timing: measure -> +%.0f ms feeder -> next %.0f ms RIC "
+                    "tick -> +%.0f ms feeder -> apply (AlignToControlLoop=true)\n",
+                    feeder.Get().GetMilliSeconds() * 1.0,
+                    loop.Get().GetMilliSeconds() * 1.0,
+                    feeder.Get().GetMilliSeconds() * 1.0);
+    }
 
     // mMIMO codebook the xApp selects beams from.
     g_codebook = CreateObject<OranNtnMmimoCodebook>();
     g_codebook->Configure(numTx, 64);
     g_codebook->PopulateDftAzimuthSweep(numTx, 64);
 
-    InternetStackHelper internet;
-    internet.Install(nodes);
+    std::printf("# %5s  %7s  %9s  %9s  %5s  %8s  %9s\n",
+                "t_s", "elev", "measured", "intrinsic", "beam", "tbler", "goodput");
 
-    PointToPointHelper p2p;
-    p2p.SetDeviceAttribute(
-        "DataRate",
-        DataRateValue(DataRate(static_cast<uint64_t>(linkCapacityMbps * 1e6))));
-    p2p.SetChannelAttribute("Delay", TimeValue(Seconds(leoAltKm * 1000.0 / kC)));
-    NetDeviceContainer devices = p2p.Install(nodes);
-    g_em = CreateObject<RateErrorModel>();
-    g_em->SetUnit(RateErrorModel::ERROR_UNIT_PACKET);
-    g_em->SetRate(1.0);
-    devices.Get(0)->SetAttribute("ReceiveErrorModel", PointerValue(g_em));
-    g_channel = DynamicCast<PointToPointChannel>(devices.Get(0)->GetChannel());
+    // KPM tick: telemetry on the MEASURED radio (intrinsic = measured - own
+    // beam gain, so the xApp decision is stable across its own actions).
+    Ptr<MobilityModel> ueMob = ueNodes.Get(0)->GetObject<MobilityModel>();
+    uint64_t lastRx = 0;
+    rs.RegisterPeriodicCallback(
+        Seconds(1.0),
+        [ueMob, satEnu, &lastRx](Time now) {
+            const CellBeamState& st = g_beams[kCellId];
+            const double measured = g_rs->GetUeRecentSinrDb(0);
+            const double comp = st.on ? st.gainDb : 0.0;
+            const double intrinsic = measured - comp;
+            const double elev = ElevDegEnu(ueMob->GetPosition(), satEnu->GetPosition());
+            if (!std::isnan(measured))
+            {
+                E2KpmReport r{};
+                r.timestamp = now.GetSeconds();
+                r.gnbId = g_e2->GetNodeId();
+                r.isNtn = true;
+                r.ueId = 1;
+                r.sinr_dB = intrinsic;
+                r.elevation_deg = elev;
+                g_e2->SubmitKpmMeasurement(r);
+            }
+            const uint64_t rx = g_rs->GetUeRxBytes(0);
+            const double mbps = (rx - lastRx) * 8.0 / 1e6;
+            lastRx = rx;
+            std::printf("  %5.1f  %7.2f  %9.2f  %9.2f  %5s  %8.3f  %9.3f\n",
+                        now.GetSeconds(), elev, measured, intrinsic,
+                        st.on ? "ON" : "off", g_rs->GetUeRecentTbler(0), mbps);
+        });
 
-    Ipv4AddressHelper ipv4;
-    ipv4.SetBase("10.90.1.0", "255.255.255.0");
-    Ipv4InterfaceContainer ifaces = ipv4.Assign(devices);
-
-    const uint16_t port = 7900;
-    PacketSinkHelper sinkHelper(
-        "ns3::UdpSocketFactory",
-        InetSocketAddress(Ipv4Address::GetAny(), port));
-    ApplicationContainer sinkApp = sinkHelper.Install(nodes.Get(0));
-    sinkApp.Start(Seconds(0.0));
-    sinkApp.Stop(Seconds(simSeconds));
-    g_sink = DynamicCast<PacketSink>(sinkApp.Get(0));
-
-    OnOffHelper onoff("ns3::UdpSocketFactory",
-                      InetSocketAddress(ifaces.GetAddress(0), port));
-    onoff.SetAttribute("DataRate", DataRateValue(DataRate(uint64_t(dataRateMbps * 1e6))));
-    onoff.SetAttribute("PacketSize", UintegerValue(packetBytes));
-    onoff.SetAttribute("OnTime", StringValue("ns3::ConstantRandomVariable[Constant=1]"));
-    onoff.SetAttribute("OffTime", StringValue("ns3::ConstantRandomVariable[Constant=0]"));
-    ApplicationContainer src = onoff.Install(nodes.Get(1));
-    src.Start(Seconds(1.0));
-    src.Stop(Seconds(simSeconds));
-
-    FlowMonitorHelper fmHelper;
-    Ptr<FlowMonitor> monitor = fmHelper.InstallAll();
-
-    std::printf("# oran-ntn-ric-controlled-traffic (E2-KPM -> mMIMO precoder xApp -> beam)\n");
-    std::printf("#   sim=%.0fs alt=%.0fkm freq=%.0fGHz load=%.1fMbps baseEIRP=%.0fdBm "
-                "numTx=%u (beamGain=%.1fdB) xApp=%s thresh=%.0fdB\n",
-                simSeconds, leoAltKm, freqGHz, dataRateMbps, baseEirpDbm, numTx,
-                10.0 * std::log10((double)numTx), xappEnabled ? "on" : "off",
-                sinrThreshDb);
-
-    Simulator::Schedule(Seconds(2.0), &Tick);
-    Simulator::Stop(Seconds(simSeconds + 0.1));
+    Simulator::Stop(Seconds(simSeconds));
     Simulator::Run();
+    rs.Collect();
+    rs.WriteHealthReport();
 
-    monitor->CheckForLostPackets();
-    const auto stats = monitor->GetFlowStats();
-    uint64_t txP = 0, rxP = 0;
-    for (const auto& kv : stats)
-    {
-        txP += kv.second.txPackets;
-        rxP += kv.second.rxPackets;
-    }
-    const uint64_t totalRx = g_sink ? g_sink->GetTotalRx() : 0;
-    std::printf("# === summary ===  xApp=%s beamActivations=%u  txPackets=%lu "
-                "rxPackets=%lu PDR=%.2f%% avgGoodput=%.3f Mbps\n",
-                xappEnabled ? "on" : "off", g_beamActivations,
-                (unsigned long)txP, (unsigned long)rxP,
-                txP ? 100.0 * rxP / txP : 0.0, totalRx * 8.0 / simSeconds / 1e6);
+    std::printf("# === summary ===  xApp=%s beamActivations=%u  measured cell "
+                "SINR=%.2f dB TBLER=%.4f throughput=%.3f Mbps (control loop on the "
+                "measured radio; RC actions via ReceiveRcAction, one feeder delay "
+                "each way)\n",
+                xappEnabled ? "on" : "off", g_beams[kCellId].activations,
+                rs.GetMeanDlSinrDb(), rs.GetMeanDlTbler(), rs.GetRxThroughputMbps());
+
     Simulator::Destroy();
     return 0;
 }
