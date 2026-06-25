@@ -1,15 +1,16 @@
 # Install & run — oran-ntn
 
-This guide walks you through installing the `oran-ntn` Space O-RAN reference module.
-The **recommended** way is to install it inside the
-[ns3-ntn-toolkit](https://github.com/Muhammaduazir69/ns3-ntn-toolkit) tree, where every
-dependency is already present. Since v2.1 the module and its examples depend on the
-toolkit's `ntn-traffic` module (`NtnRealStackHelper`, `NtnOranApplication`/`NtnOranApplicationSink`,
-`NtnOranAiFlowMonitor`) and `ntn-constellation` module (`Sgp4MobilityModel`,
-`WalkerConstellation`) — so a vanilla ns-3.43 tree works only if you also add the
-toolkit's `ntn-traffic`, `ntn-constellation`, `ntn-cho`, `satellite`, and `mmwave`
-modules. ONNX Runtime is optional (CMake auto-detects it for the ONNX xApp; without
-it the xApp falls back to the registered heuristic).
+`oran-ntn` is an ns-3.43 contributed module that brings the O-RAN
+disaggregated RAN control architecture to non-terrestrial networks: a
+multi-tier RIC (real-time / Near-RT / on-board **Space-RIC**), E2AP-style
+termination over SCTP/TCP, A1 policy ingest, KPM/RC/CCC service models, and
+xApps with a conflict manager. The recommended way to run it is inside the
+[ns3-ntn-toolkit](https://github.com/Muhammaduazir69/ns3-ntn-toolkit) tree
+(branch `ntn-integration-v2`), where every dependency below is already
+present. It also builds on a vanilla ns-3.43 tree, provided you add the
+sibling toolkit modules listed in section 2 — the library links `satellite`,
+`mmwave`, and `ntn-traffic`; the examples additionally pull in `ntn-cho`,
+`ntn-constellation`, `ntn-slice`, and `ntn-observability`.
 
 ---
 
@@ -17,72 +18,78 @@ it the xApp falls back to the registered heuristic).
 
 | Component | Version |
 |---|---|
-| OS | Linux (Ubuntu 22.04+ / Fedora 39+) |
+| OS | Linux (Ubuntu 22.04+ / Fedora 39+ recommended) |
 | C++ compiler | gcc ≥ 11 or clang ≥ 14 |
 | CMake | ≥ 3.24 |
-| Python | ≥ 3.10 (3.13 supported) |
+| Python | ≥ 3.10 |
 | ns-3 | **3.43** |
-| Disk | ~6 GB after build |
+| Disk | ~6 GB after build (incl. SNS3 TLE data) |
+
+Two optional system libraries are auto-detected at configure time:
+
+| Library | Enables | Fallback when absent |
+|---|---|---|
+| `libsctp` (`libsctp-dev`) | E2AP transport over real SCTP in `flexric-bridge/` | runtime fallback to TCP |
+| ONNX Runtime (`onnxruntime`) | real inference in `OranNtnOnnxXapp` | registered heuristic xApp |
+| SQLite3 (`libsqlite3-dev`) | NIST-pattern E2 data repository | in-memory store |
 
 ---
 
-## 2. Prerequisites
+## 2. Dependencies
 
-### 2a. ns3-ntn-toolkit tree (RECOMMENDED)
+### 2a. SNS3 `satellite` (REQUIRED — library links it)
 
-Easiest — all required sibling modules ship in `contrib/` already:
-
-```bash
-git clone https://github.com/Muhammaduazir69/ns3-ntn-toolkit.git
-cd ns3-ntn-toolkit
-```
-
-If you take this route, skip straight to section 3.
-
-### 2b. Vanilla ns-3.43: required toolkit modules
-
-On a plain ns-3.43 tree you must add **all** of the following to `contrib/`
-before `oran-ntn` will configure:
+The O-RAN/NTN bridge and SGP4 geometry use the SNS3 `satellite` module:
 
 ```bash
 cd contrib/
-# Toolkit modules (v2.1 hard dependencies of oran-ntn and its examples):
-#   ntn-traffic        — NtnRealStackHelper, NtnOranApplication/Sink, NtnOranAiFlowMonitor
-#   ntn-constellation  — Sgp4MobilityModel, WalkerConstellation
-#   ntn-cho            — TTE-aware CHO used by the example scenarios
-git clone https://github.com/Muhammaduazir69/ns3-ntn-toolkit.git /tmp/ns3-ntn-toolkit
-cp -r /tmp/ns3-ntn-toolkit/contrib/ntn-traffic .
-cp -r /tmp/ns3-ntn-toolkit/contrib/ntn-constellation .
-cp -r /tmp/ns3-ntn-toolkit/contrib/ntn-cho .
-# SNS3 satellite (REQUIRED):
 git clone https://github.com/sns3/sns3-satellite.git satellite
-# mmWave NR PHY (REQUIRED):
+cd ..
+```
+
+> Size note: SNS3 + bundled TLE data is ~3.7 GB.
+
+### 2b. mmWave NR PHY (REQUIRED — library links it)
+
+The measured data plane runs real mmwave NR NTN cells, so `contrib/mmwave`
+(and its bundled `lte` dependency) must be present. The toolkit uses the
+**NYU/UNIPD** ns-3-mmwave module — **not** the CTTC NR module:
+
+```bash
+cd contrib/
 git clone https://github.com/nyuwireless-unipd/ns3-mmwave.git mmwave
 cd ..
 ```
 
-### 2c. ONNX Runtime (OPTIONAL, only for the ONNX xApp)
+### 2c. `ntn-traffic` (REQUIRED — library links it)
 
-`OranNtnOnnxXapp` runs real inference when ONNX Runtime is installed; CMake
-auto-detects it (`find_library(onnxruntime)`) and defines `HAVE_ONNXRUNTIME`.
-Without it the build still succeeds and the xApp falls back to the registered
-heuristic.
+`oran-ntn` links `ntn-traffic`, whose `NtnRealStackHelper` stands up the
+actual mmwave NR NTN stack (SpectrumPhy + MAC + HARQ/AMC + RLC/PDCP + RRC +
+EPC) the RICs measure KPIs from. It is bundled in the toolkit under
+`contrib/ntn-traffic/`; on a vanilla tree, copy it from the toolkit into
+`contrib/ntn-traffic`.
 
-### 2d. ns3-ai fork (OPTIONAL, only for RL-driven xApps)
+### 2d. Example-only siblings (REQUIRED for the examples)
 
-```bash
-cd contrib/
-git clone https://github.com/Muhammaduazir69/ns3-ai.git ai
-cd ..
-```
+The examples additionally link `ntn-cho`, `ntn-constellation`, `ntn-slice`,
+and `ntn-observability`. All four are bundled in the toolkit under
+`contrib/`; on a vanilla tree, copy them from the toolkit. The `oran-ntn`
+library itself builds without them — the examples do not.
+
+### 2e. `ns3-ai-ntn` (OPTIONAL — learning-based xApps / gym envs)
+
+The gym handover / beam-hop / slice / steering environments and
+`OranNtnFederatedLearning` bridge to Python via the toolkit's `ns3-ai-ntn`
+fork. The E2/KPM/RC control loop and all heuristic xApps build and run
+**without** it. When present in `contrib/`, the build links it automatically.
 
 ---
 
-## 3. Install the oran-ntn module
+## 3. Install the module
 
 ```bash
 cd contrib/
-git clone https://github.com/Muhammaduazir69/oran-ntn.git oran-ntn
+git clone -b oran-ntn-v2 https://github.com/Muhammaduazir69/oran-ntn.git oran-ntn
 cd ..
 ```
 
@@ -93,89 +100,114 @@ cd ..
 ```bash
 ./ns3 configure --enable-examples --enable-tests
 ./ns3 build oran-ntn
-```
-
-Verify:
-
-```bash
-./ns3 show profile | grep oran-ntn
+./ns3 show profile | grep oran-ntn   # expect: ... oran-ntn ...
 ```
 
 ---
 
-## 5. Run examples
+## 5. Run the examples
 
-### 5a. Full scenario with 5 concurrent xApps (~1 min wall-clock)
-
-```bash
-./ns3 run "oran-ntn-full-scenario \
-  --simTime=600 \
-  --xapps=ho,beamhop,slice,doppler,tnntn \
-  --feederDelay=4 \
-  --rngRun=1 \
-  --outputDir=oran-ntn-output/"
-```
-
-CSV outputs land under `oran-ntn-output/`:
-`action_log.csv` · `xapp_metrics.csv` · `space_ric_metrics.csv` ·
-`conflict_log.csv` · `kpm_dataset.csv`.
-
-### 5b. Stressed-feeder regime (Space RIC takes over)
+### 5a. oran-ntn-full-scenario — constellation-scale multi-tier RIC (flagship)
 
 ```bash
-./ns3 run "oran-ntn-full-scenario \
-  --simTime=600 \
-  --xapps=ho,beamhop \
-  --feederDelay=250 \
-  --feederOutageEvery=30 \
-  --feederOutageDuration=2"
+./ns3 run "oran-ntn-full-scenario --duration=120 --numPlanes=6 --satsPerPlane=11 --numUes=50 --enableSpaceRic=true --outputDir=/tmp/oran"
 ```
+Anchored cells measured on a real mmwave NR NTN link; the remaining cells use
+a TR 38.821-style budget over the same live SGP4 geometry (per-row provenance
+in `kpm_feed.csv`). Args include `duration`, `numPlanes`, `satsPerPlane`,
+`altitude`, `inclination`, `numTnGnbs`, `numUes`, `numRealCells`,
+`realUesPerCell`, `kpmInterval`, `minElev`, `serviceElev`, `stickyServing`,
+`satEirpDbm`, `freqGhz`, `bwMhz`, `conflictStrategy`, `enableSpaceRic`,
+`enableFL`, `outputDir`.
 
-### 5c. Run the test suite
+### 5b. oran-ntn-ric-controlled-traffic — closed RIC control loop
 
 ```bash
-./ns3 run "test-runner --suite=oran-ntn --verbose"
+./ns3 run "oran-ntn-ric-controlled-traffic --simSeconds=120 --xapp=mmimo --sinrThreshDb=5 --outputDir=/tmp/ric"
 ```
+E2-KPM from the measured mmwave PHY drives an mMIMO precoder xApp, whose beam
+decision is applied back onto the real link. Args: `simSeconds`, `leoAltKm`,
+`freqGHz`, `satEirpDbm`, `numTx`, `sinrThreshDb`, `xapp`, `outputDir`.
+
+### 5c. oran-ntn-real-stack-scenario — real-stack RIC flagship
+
+```bash
+./ns3 run "oran-ntn-real-stack-scenario --duration=120 --numUes=10 --numSats=4 --outputDir=/tmp/realstack"
+```
+KPM from MEASURED mmwave PHY SINR drives the RIC. Args: `duration`, `numUes`,
+`numSats`, `altitude`, `satEirpDbm`, `freqGhz`, `bwMhz`, `minElev`,
+`conflictStrategy`, `netSim`, `czml`, `outputDir`.
+
+### 5d. ntn-e2e-full-stack — RIC + slice + observability composition
+
+```bash
+./ns3 run "ntn-e2e-full-stack --duration=120 --numUes=10 --outputDir=/tmp/e2e"
+```
+One shared mmwave cell feeds the RIC, the slice manager, and observability.
+Args: `duration`, `numUes`, `altitude`, `satEirpDbm`, `outputDir`.
+
+### 5e. oran-ntn-e2-termination — two-process E2 over real SCTP
+
+```bash
+# Terminal 1 (RIC side):
+./ns3 run "oran-ntn-e2-termination --role=ric --proto=sctp --port=36421 --duration=20"
+# Terminal 2 (E2 agent side):
+./ns3 run "oran-ntn-e2-termination --role=agent --proto=sctp --host=127.0.0.1 --port=36421 --indications=10"
+```
+Standalone E2 end-to-end driver exercising the `flexric-bridge/` transport.
+Args: `role` (ric|agent), `proto` (sctp|tcp), `host`, `port`, `duration`,
+`indications`. Falls back to TCP if the kernel SCTP module is unavailable.
+
+### Other built examples
+
+`oran-ntn-ric-placement-ab`, `oran-ntn-cross-domain-slice`,
+`oran-ntn-payload-options-ab`, `ntn-platform-latency-validation`, and
+`oran-ntn-emergency-communication` (args: `simSeconds`, `disasterAt`,
+`outputDir`) cover the WS3–WS6 A/B and flagship studies.
 
 ---
 
-## 6. RL-driven xApp (requires ns3-ai)
+## 6. Run the unit tests
+
+`oran-ntn` registers **three** test suites:
 
 ```bash
-# Train the HO-prediction xApp with DQN
-cd contrib/oran-ntn/python/
-pip install -r requirements.txt
-python3 train_ho_xapp.py --algo=dqn --episodes=200
+./test.py --suite=oran-ntn                # core E2 / A1 / KPM / RIC / xApp framework
+./test.py --suite=oran-ntn-multi-tier-ric # RT / Near-RT / Space-RIC + placement
+./test.py --suite=oran-ntn-ws4            # payload options / FH split / platform spec
 ```
 
-The agent uses the 68-feature observation exposed by the `ntn-cho` module via the ns3-ai shared-memory bridge. Training curves land in `runs/`.
+The aggregate KPIs in any associated manuscript come from sweeping
+`oran-ntn-full-scenario` / `oran-ntn-real-stack-scenario` over seeds and
+xApp settings and aggregating the CSV output; they are not asserted by the
+unit suites.
 
 ---
 
 ## 7. Common issues
 
-**`oran-ntn not found` after configure**
-You're missing one of the dependencies. Verify all of `ntn-traffic`, `ntn-constellation`, `ntn-cho`, `satellite`, `mmwave` are present in `contrib/`.
+**`oran-ntn` not registered after configure** — a required library dependency
+is missing. The library needs `contrib/satellite/`, `contrib/mmwave/`, and
+`contrib/ntn-traffic/`; it will not register without all three.
 
-**Build cache filtering modules**
-Run a clean configure:
-`./ns3 configure --enable-modules='' --enable-tests --enable-examples`.
+**Examples missing after configure** — the examples additionally need
+`ntn-cho`, `ntn-constellation`, `ntn-slice`, and `ntn-observability` in
+`contrib/` (step 2d); the library builds without them, the examples do not.
 
-**`E2SM-HO-PRED` decoder errors**
-Make sure you're on the latest commit — the ASN.1 decoder ships with the module under `model/asn1/`.
+**E2 SCTP example falls back to TCP** — `libsctp` was not found at configure
+time, or the kernel SCTP module is not loaded. Install `libsctp-dev` and
+`modprobe sctp`, or run `oran-ntn-e2-termination` with `--proto=tcp`.
+
+**`OranNtnOnnxXapp` runs the heuristic instead of an ONNX model** — ONNX
+Runtime was not found at configure time (expected and harmless); install it
+to enable real inference.
 
 ---
 
-## 8. Reproduce the paper results
+## 8. Uninstall
 
 ```bash
-cd papers/sim_runs/
-./run_oran_ntn_scenario.sh
-python3 build_figures.py
+rm -rf contrib/oran-ntn
+./ns3 configure --enable-examples
+./ns3 build
 ```
-
----
-
-## 9. Citing
-
-See [README](README.md#cite-this-work).
