@@ -11,7 +11,8 @@
  * resolution interface, and NTN-specific timing abstractions.
  *
  * Concrete xApps:
- *   - HO Prediction xApp (LSTM/DQN-based proactive handover)
+ *   - HO Prediction xApp (proactive handover; "LSTM"=EWMA+linear slope,
+ *     "DQN"=linear dot-product — see its header, not a deep net)
  *   - Beam Hopping xApp (dynamic beam scheduling)
  *   - Slice Manager xApp (eMBB/URLLC/mMTC resource allocation)
  *   - Doppler Compensation xApp (per-beam frequency correction)
@@ -162,6 +163,33 @@ class OranNtnXappBase : public Object
      */
     std::vector<E2KpmReport> GetUeReportsInWindow(uint32_t ueId, Time window) const;
 
+    /**
+     * \brief Record the UE's TRUE serving cell (the cell it is RRC-connected to).
+     *
+     * The KPM database is keyed by gnbId, so "the last report in the window" is a
+     * std::map ordering artifact (highest gnbId), NOT the serving cell. Callers
+     * that know the real serving cell — the RAN via NtnRealStackHelper
+     * ::GetUeServingCellId, or this xApp itself when it actuates a HANDOVER_TRIGGER —
+     * publish it here so serving-cell KPIs and handover decisions read the correct
+     * baseline. O-RAN WG3 E2SM-KPM identifies the serving cell by CGI/PCI, not by
+     * report arrival order.
+     */
+    void SetUeServingCell(uint32_t ueId, uint32_t gnbId);
+
+    /**
+     * \brief The UE's tracked serving cell, or false if none has been published.
+     */
+    bool GetUeServingCell(uint32_t ueId, uint32_t& gnbId) const;
+
+    /**
+     * \brief The UE's most recent report FROM ITS SERVING CELL.
+     *
+     * Resolves serving via SetUeServingCell(); if the serving cell is unknown it
+     * falls back to the most RECENT report by timestamp (defensible), never the
+     * highest-gnbId artifact. \p found is false when the UE has no report in window.
+     */
+    E2KpmReport GetUeServingReport(uint32_t ueId, Time window, bool& found) const;
+
     // ---- A1 policy access ----
     /**
      * \brief Get applicable A1 policies for this xApp's domain
@@ -246,6 +274,9 @@ class OranNtnXappBase : public Object
     uint32_t m_maxReportsPerGnb;
     Time m_dataRetentionWindow;
 
+    // UE -> serving cell (gnbId), published by the RAN or by this xApp on handover.
+    std::map<uint32_t, uint32_t> m_ueServingCell;
+
   private:
     void DecisionCycleWrapper();
     void SetupSubscriptions();
@@ -260,6 +291,12 @@ class OranNtnXappBase : public Object
     Time m_decisionInterval;
     EventId m_decisionEvent;
     std::vector<uint32_t> m_subscriptionIds;
+
+    // Timestamps of recent HANDOVER_TRIGGER actions this xApp passed the A1
+    // HO-rate policy check for. Used by CheckPolicyCompliance() to enforce
+    // A1NtnPolicy::maxHandoverRate (HO/min). Mutable: the compliance check is
+    // logically const but must record the accepted HO to rate-limit the next.
+    mutable std::deque<Time> m_recentHoTimes;
 };
 
 } // namespace ns3

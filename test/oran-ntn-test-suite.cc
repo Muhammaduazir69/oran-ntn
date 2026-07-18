@@ -51,11 +51,19 @@
 #include "ns3/oran-ntn-xapp-doppler-comp.h"
 #include "ns3/oran-ntn-xapp-energy-harvest.h"
 #include "ns3/oran-ntn-xapp-ho-predict.h"
+#include "ns3/oran-ntn-helper.h"
+#include "ns3/ntn-static-extra-loss-model.h"
+#include "ns3/oran-ntn-twin-prediction-consumer.h"
+
+#include <fstream>
 #include "ns3/oran-ntn-xapp-interference-mgmt.h"
 #include "ns3/oran-ntn-xapp-multi-conn.h"
 #include "ns3/oran-ntn-xapp-predictive-alloc.h"
 #include "ns3/oran-ntn-xapp-slice-manager.h"
 #include "ns3/oran-ntn-xapp-tn-ntn-steering.h"
+#include "ns3/oran-ntn-gym-handover.h"
+#include "ns3/container.h"
+#include "ns3/spaces.h"
 #include "ns3/test.h"
 
 #include <map>
@@ -1551,6 +1559,33 @@ class OranNtnPhyKpmExtractorTestCase : public TestCase
         NS_TEST_ASSERT_MSG_EQ(trackedIds.size(), 0u,
                                "Should have no tracked UEs initially");
 
+        // Measured feed path (audit fix 3): RegisterRnti populates the RNTI->UE
+        // map that every ingest reads; without it the sample is dropped. Register
+        // RNTI 61 -> UE 5 on cell 2, then feed one MEASURED PHY sample.
+        const uint16_t kRnti = 61;
+        const uint32_t kUeId = 5;
+        extractor->RegisterRnti(kRnti, kUeId, /*servingCellId=*/2);
+
+        // First sample establishes the RX-byte baseline (SINR still recorded).
+        extractor->IngestMeasuredSample(kRnti, /*sinrDb=*/11.5,
+                                        /*cumulativeRxBytes=*/0, /*tbler=*/0.05);
+        NS_TEST_ASSERT_MSG_EQ(extractor->HasPhyData(kUeId), true,
+                               "UE should have PHY data after a measured sample");
+
+        // An UNREGISTERED RNTI must be dropped (no fabricated UE state).
+        extractor->IngestMeasuredSample(/*rnti=*/999, 20.0, 1000, 0.0);
+        NS_TEST_ASSERT_MSG_EQ(extractor->GetTrackedUeIds().size(), 1u,
+                               "Unknown RNTI must not create a UE");
+
+        // The report must carry the MEASURED SINR and be flagged measured.
+        E2KpmReport rep = extractor->GetRealKpmReport(kUeId);
+        NS_TEST_ASSERT_MSG_EQ_TOL(rep.sinr_dB, 11.5, 1e-6,
+                                  "GetRealKpmReport must return the measured SINR");
+        NS_TEST_ASSERT_MSG_EQ(rep.blerMeasured, true,
+                               "BLER must be flagged measured after a TBLER sample");
+        NS_TEST_ASSERT_MSG_EQ(rep.gnbId, 2u,
+                               "Serving cell id from RegisterRnti must propagate");
+
         extractor->Dispose();
         Simulator::Destroy();
     }
@@ -1613,8 +1648,8 @@ class OranNtnKpmCanonicalIdsListTestCase : public TestCase
     {
         const auto& ids = oranntn::kpm::CanonicalMetricIds();
         NS_TEST_ASSERT_MSG_EQ(ids.size(),
-                              10u,
-                              "canonical KPM set must have 10 entries");
+                              12u,
+                              "canonical KPM set must have 12 entries");
         NS_TEST_EXPECT_MSG_EQ(ids[0], "DRB.UEThpDl", "ids[0]");
         NS_TEST_EXPECT_MSG_EQ(ids[1], "DRB.UEThpUl", "ids[1]");
         NS_TEST_EXPECT_MSG_EQ(ids[2], "DRB.PdcpSduVolumeDL", "ids[2]");
@@ -1625,6 +1660,8 @@ class OranNtnKpmCanonicalIdsListTestCase : public TestCase
         NS_TEST_EXPECT_MSG_EQ(ids[7], "RRU.PrbUsedUl", "ids[7]");
         NS_TEST_EXPECT_MSG_EQ(ids[8], "CARR.AverageSINR", "ids[8]");
         NS_TEST_EXPECT_MSG_EQ(ids[9], "L1M.RS-SINR.Mean", "ids[9]");
+        NS_TEST_EXPECT_MSG_EQ(ids[10], "TB.TotNbrDl", "ids[10]");
+        NS_TEST_EXPECT_MSG_EQ(ids[11], "TB.ErrTotNbrDl", "ids[11]");
 
         NS_TEST_EXPECT_MSG_EQ(std::string(oranntn::label::kFiveQi),
                               "FIVE_QI",
@@ -1642,7 +1679,7 @@ class OranNtnKpmCanonicalBuildTestCase : public TestCase
 {
   public:
     OranNtnKpmCanonicalBuildTestCase()
-        : TestCase("BuildCanonicalKpmMeasurements emits all 10 IDs with correct values")
+        : TestCase("BuildCanonicalKpmMeasurements emits all 12 IDs with correct values")
     {
     }
 
@@ -1654,6 +1691,7 @@ class OranNtnKpmCanonicalBuildTestCase : public TestCase
         r.sinr_dB = 12.5;
         r.throughput_Mbps = 50.0; // 50 000 kbps
         r.prbUtilization = 0.5;   // 50% of 273 PRBs => 136.5
+        r.harqBler = 0.02;        // measured DL HARQ BLER fraction
 
         const std::map<std::string, std::string> base = {
             {oranntn::label::kFiveQi, "9"},
@@ -1661,7 +1699,7 @@ class OranNtnKpmCanonicalBuildTestCase : public TestCase
             {oranntn::label::kPlmn, "00101"},
         };
         const auto v = oranntn::BuildCanonicalKpmMeasurements(r, base);
-        NS_TEST_ASSERT_MSG_EQ(v.size(), 10u, "vector size");
+        NS_TEST_ASSERT_MSG_EQ(v.size(), 12u, "vector size");
 
         // Build a name->index map so the test is robust to ordering.
         std::map<std::string, size_t> idx;
@@ -1707,6 +1745,27 @@ class OranNtnKpmCanonicalBuildTestCase : public TestCase
             v[idx[oranntn::kpm::kDrbUeThpDl]].labels.count(oranntn::label::kPresent),
             0u,
             "DL throughput has no override label");
+
+        // TB.TotNbrDl / TB.ErrTotNbrDl — canonical TS 28.552 DL TB counters.
+        // No integrating absolute-TB counter is plumbed yet, so both are
+        // present=false; TB.ErrTotNbrDl carries the measured HARQ BLER fraction.
+        NS_TEST_ASSERT_MSG_EQ(idx.count(oranntn::kpm::kTbTotNbrDl),
+                              1u,
+                              "TB.TotNbrDl present");
+        NS_TEST_ASSERT_MSG_EQ(idx.count(oranntn::kpm::kTbErrTotNbrDl),
+                              1u,
+                              "TB.ErrTotNbrDl present");
+        NS_TEST_EXPECT_MSG_EQ(
+            v[idx[oranntn::kpm::kTbTotNbrDl]].labels.at(oranntn::label::kPresent),
+            "false",
+            "TB.TotNbrDl marked not-present");
+        NS_TEST_EXPECT_MSG_EQ(
+            v[idx[oranntn::kpm::kTbErrTotNbrDl]].labels.at(oranntn::label::kPresent),
+            "false",
+            "TB.ErrTotNbrDl marked not-present");
+        NS_TEST_EXPECT_MSG_EQ(v[idx[oranntn::kpm::kTbErrTotNbrDl]].value,
+                              0.02,
+                              "TB.ErrTotNbrDl carries measured HARQ BLER");
     }
 };
 
@@ -1732,7 +1791,7 @@ class OranNtnKpmCanonicalLabelsTestCase : public TestCase
             {oranntn::label::kPlmn, "00102"},
         };
         const auto v = oranntn::BuildCanonicalKpmMeasurements(r, base);
-        NS_TEST_ASSERT_MSG_EQ(v.size(), 10u, "vector size");
+        NS_TEST_ASSERT_MSG_EQ(v.size(), 12u, "vector size");
         for (const auto& m : v)
         {
             NS_TEST_EXPECT_MSG_EQ(m.labels.at(oranntn::label::kFiveQi),
@@ -2100,7 +2159,7 @@ class OranNtnKpmCanonicalCsvTestCase : public TestCase
 {
   public:
     OranNtnKpmCanonicalCsvTestCase()
-        : TestCase("Canonical kpm_canonical.csv is long-format with 10 rows per E2KpmReport")
+        : TestCase("Canonical kpm_canonical.csv is long-format with 12 rows per E2KpmReport")
     {
     }
 
@@ -2144,7 +2203,7 @@ class OranNtnKpmCanonicalCsvTestCase : public TestCase
         std::getline(is, header);
         NS_TEST_EXPECT_MSG_EQ(header,
                               "timestamp,gnb_id,is_ntn,ue_id,metric_id,"
-                              "value,present,FIVE_QI,S-NSSAI,PLMN",
+                              "value,present,provenance,FIVE_QI,S-NSSAI,PLMN",
                               "long-format header");
 
         const std::set<std::string> canonical = {
@@ -2153,6 +2212,7 @@ class OranNtnKpmCanonicalCsvTestCase : public TestCase
             oranntn::kpm::kRruPrbAvailDl,   oranntn::kpm::kRruPrbAvailUl,
             oranntn::kpm::kRruPrbUsedDl,    oranntn::kpm::kRruPrbUsedUl,
             oranntn::kpm::kCarrAvgSinr,     oranntn::kpm::kL1mRsSinrMean,
+            oranntn::kpm::kTbErrTotNbrDl,   oranntn::kpm::kTbTotNbrDl,
         };
         size_t rowCount = 0;
         size_t notPresentCount = 0;
@@ -2177,32 +2237,44 @@ class OranNtnKpmCanonicalCsvTestCase : public TestCase
                 }
             }
             f.push_back(cur);
-            NS_TEST_ASSERT_MSG_EQ(f.size(), 10u, "10 columns per row");
+            NS_TEST_ASSERT_MSG_EQ(f.size(), 11u, "11 columns per row (incl. provenance)");
             const std::string& metricId = f[4];
             NS_TEST_EXPECT_MSG_EQ(canonical.count(metricId),
                                   1u,
                                   std::string("metric_id '") + metricId +
                                       "' is canonical");
             seenIds.insert(metricId);
-            NS_TEST_EXPECT_MSG_EQ(f[7], "9", "FIVE_QI column");
-            NS_TEST_EXPECT_MSG_EQ(f[8], "1-000001", "S-NSSAI column");
-            NS_TEST_EXPECT_MSG_EQ(f[9], "00101", "PLMN column");
+            // f[7] = provenance (measured|derived|synthesized)
+            NS_TEST_EXPECT_MSG_EQ((f[7] == "measured" || f[7] == "derived" ||
+                                   f[7] == "synthesized"),
+                                  true,
+                                  std::string("provenance '") + f[7] + "' is valid");
+            // A not-present value must be tagged synthesized (no ground truth).
+            if (f[6] == "0")
+            {
+                NS_TEST_EXPECT_MSG_EQ(f[7], "synthesized",
+                                      "not-present rows are synthesized");
+            }
+            NS_TEST_EXPECT_MSG_EQ(f[8], "9", "FIVE_QI column");
+            NS_TEST_EXPECT_MSG_EQ(f[9], "1-000001", "S-NSSAI column");
+            NS_TEST_EXPECT_MSG_EQ(f[10], "00101", "PLMN column");
             if (f[6] == "0")
             {
                 ++notPresentCount;
             }
         }
-        // 3 reports x 10 canonical metrics = 30 rows.
-        NS_TEST_EXPECT_MSG_EQ(rowCount, 30u, "row count");
+        // 3 reports x 12 canonical metrics = 36 rows.
+        NS_TEST_EXPECT_MSG_EQ(rowCount, 36u, "row count");
         NS_TEST_EXPECT_MSG_EQ(seenIds.size(),
-                              10u,
-                              "all 10 canonical IDs emitted at least once");
-        // Three UL-side IDs are not-present per report -> 3 * 3 = 9 rows
-        // should carry present=0 (the v2.1 baseline; will drop to 0 once
-        // 4.1.9 CU/DU/RU split plumbs UL counters).
+                              12u,
+                              "all 12 canonical IDs emitted at least once");
+        // Five IDs are not-present per report (3 UL-side: DRB.UEThpUl,
+        // DRB.PdcpSduVolumeUL, RRU.PrbUsedUl; plus the two TB counters
+        // TB.TotNbrDl / TB.ErrTotNbrDl which lack an integrating absolute-TB
+        // counter at the v2.1 baseline) -> 5 * 3 = 15 rows carry present=0.
         NS_TEST_EXPECT_MSG_EQ(notPresentCount,
-                              9u,
-                              "3 UL metrics x 3 reports = 9 not-present rows");
+                              15u,
+                              "5 not-present metrics x 3 reports = 15 rows");
     }
 };
 
@@ -4817,6 +4889,464 @@ class OranNtnMmimoXappFailureModesTest : public TestCase
 };
 
 // ============================================================================
+//  Gate 8: xApp decision reaches E2-node actuation (moves serving cell)
+//  Proves the O-RAN actuation closed loop is NOT a decision island: an xApp
+//  HANDOVER_TRIGGER travels xApp -> RIC -> E2 termination -> target E2 node,
+//  and the target node's RC-action callback actually fires (with the right
+//  target gnb/UE) one FeederLinkDelay after submission -- i.e. the command
+//  crossed the return feeder link and reached real actuation, not accept-and-
+//  discard.
+// ============================================================================
+
+class OranNtnXappMovesServingCellTest : public TestCase
+{
+  public:
+    OranNtnXappMovesServingCellTest()
+        : TestCase("Gate 8: xApp HANDOVER_TRIGGER reaches target E2-node "
+                   "actuation (moves serving cell, not a decision island)")
+    {
+    }
+
+  private:
+    uint32_t m_fireCount{0};
+    uint32_t m_actuatedGnb{0};
+    uint32_t m_actuatedUe{0};
+    Time m_fireTime{Seconds(0)};
+
+    bool CaptureActuation(E2RcAction action)
+    {
+        m_fireCount++;
+        m_actuatedGnb = action.targetGnbId;
+        m_actuatedUe = action.targetUeId;
+        m_fireTime = Simulator::Now();
+        return true;
+    }
+
+    void DoRun() override
+    {
+        const Time feederDelay = MilliSeconds(20);
+        const uint32_t servingGnb = 1;
+        const uint32_t targetGnb = 2;
+        const uint32_t ueRnti = 55;
+
+        auto ric = CreateObject<OranNtnNearRtRic>();
+        ric->Initialize();
+
+        // Serving E2 node (gnb 1): registered so the cell exists, no capture.
+        auto e2node1 = CreateObject<OranNtnE2Node>();
+        e2node1->SetNodeId(servingGnb);
+        e2node1->SetIsNtn(true);
+        e2node1->SetFeederLinkDelay(feederDelay);
+        e2node1->RegisterRanFunction(3, "RC");
+        ric->ConnectE2Node(e2node1);
+
+        // Target E2 node (gnb 2): the actuation endpoint we capture.
+        auto e2node2 = CreateObject<OranNtnE2Node>();
+        e2node2->SetNodeId(targetGnb);
+        e2node2->SetIsNtn(true);
+        e2node2->SetFeederLinkDelay(feederDelay);
+        e2node2->RegisterRanFunction(3, "RC");
+        e2node2->SetRcActionCallback(
+            MakeCallback(&OranNtnXappMovesServingCellTest::CaptureActuation, this));
+        ric->ConnectE2Node(e2node2);
+
+        // xApp registered with the RIC so SubmitAction() actually routes.
+        auto xapp = CreateObject<OranNtnXappHoPredict>();
+        xapp->SetXappName("gate8-mover");
+        xapp->SetPriority(10);
+        ric->RegisterXapp(xapp);
+
+        // Build and submit a HANDOVER_TRIGGER moving the UE onto gnb 2.
+        E2RcAction action{};
+        action.timestamp = Simulator::Now().GetSeconds();
+        action.xappId = xapp->GetXappId();
+        action.xappName = xapp->GetXappName();
+        action.actionType = E2RcActionType::HANDOVER_TRIGGER;
+        action.targetGnbId = targetGnb;
+        action.targetUeId = ueRnti;
+        action.targetBeamId = 0;
+        action.targetSliceId = 0;
+        action.confidence = 1.0;
+        action.parameter1 = 0.0;
+        action.parameter2 = 0.0;
+        action.executed = false;
+
+        bool accepted = xapp->SubmitAction(action);
+        NS_TEST_ASSERT_MSG_EQ(accepted, true,
+                              "RIC must accept and route the HANDOVER_TRIGGER "
+                              "to gnb 2 (action was not a decision island)");
+
+        // The action must NOT have fired inline at submission time.
+        NS_TEST_ASSERT_MSG_EQ(m_fireCount, 0u,
+                              "Actuation must be deferred across the feeder "
+                              "link, not executed inline at submission");
+
+        Simulator::Stop(Seconds(1));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(m_fireCount, 1u,
+                              "Target-node RC actuation callback must fire "
+                              "exactly once");
+        NS_TEST_ASSERT_MSG_EQ(m_actuatedGnb, targetGnb,
+                              "Actuated action must target gnb 2");
+        NS_TEST_ASSERT_MSG_EQ(m_actuatedUe, ueRnti,
+                              "Actuated action must carry the target UE rnti");
+        NS_TEST_ASSERT_MSG_EQ(m_fireTime, feederDelay,
+                              "Actuation must occur at t = FeederLinkDelay "
+                              "(command crossed the return feeder link), not "
+                              "inline at t = 0");
+
+        ric->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// ============================================================================
+//  Gate 10: RL action -> SINR improvement
+//  An OranNtnGymHandover bound to an xApp observes one UE with a low-SINR
+//  serving cell and a high-SINR candidate. A discrete RL action ("handover to
+//  first candidate") must (a) actuate a real HANDOVER_TRIGGER toward the
+//  high-SINR gnb (verified at the target E2 node's RC callback), and (b) move
+//  the UE toward higher SINR (candidate SINR > pre-action serving SINR).
+//
+//  Serving cell is resolved by IDENTITY: the test publishes the UE's true
+//  serving cell via OranNtnXappBase::SetUeServingCell(), so the low-SINR serving
+//  cell can carry the NATURAL lower gnbId (1) and the high-SINR target the higher
+//  id (2) — the old highest-gnbId map-ordering artifact is gone.
+// ============================================================================
+
+class OranNtnRlActionImprovesSinrTest : public TestCase
+{
+  public:
+    OranNtnRlActionImprovesSinrTest()
+        : TestCase("Gate 10: RL discrete action drives the UE toward higher "
+                   "SINR and actuates the handover at the target E2 node")
+    {
+    }
+
+  private:
+    uint32_t m_fireCount{0};
+    uint32_t m_actuatedGnb{0};
+    uint32_t m_actuatedUe{0};
+
+    bool CaptureActuation(E2RcAction action)
+    {
+        m_fireCount++;
+        m_actuatedGnb = action.targetGnbId;
+        m_actuatedUe = action.targetUeId;
+        return true;
+    }
+
+    void DoRun() override
+    {
+        const Time feederDelay = MilliSeconds(10);
+        const uint32_t ueId = 7;
+        const uint32_t servingGnb = 1; // low SINR, NATURAL lower id (serving by identity)
+        const uint32_t targetGnb = 2;  // high SINR (handover candidate/target)
+        const double servingSinr = 3.0;
+        const double candSinr = 15.0;
+
+        auto ric = CreateObject<OranNtnNearRtRic>();
+        ric->Initialize();
+
+        // Target E2 node (gnb 2) captures the actuated handover.
+        auto e2node2 = CreateObject<OranNtnE2Node>();
+        e2node2->SetNodeId(targetGnb);
+        e2node2->SetIsNtn(true);
+        e2node2->SetFeederLinkDelay(feederDelay);
+        e2node2->RegisterRanFunction(3, "RC");
+        e2node2->SetRcActionCallback(
+            MakeCallback(&OranNtnRlActionImprovesSinrTest::CaptureActuation, this));
+        ric->ConnectE2Node(e2node2);
+
+        auto xapp = CreateObject<OranNtnXappHoPredict>();
+        xapp->SetXappName("gate10-rl");
+        xapp->SetPriority(10);
+        ric->RegisterXapp(xapp);
+
+        auto gym = CreateObject<OranNtnGymHandover>();
+        gym->SetXapp(xapp);
+        gym->SetMaxCandidates(4);
+
+        // Inject one low-SINR serving report and one high-SINR candidate report
+        // for the same UE, stamped at the current sim time (t = 0).
+        auto feed = [&](uint32_t gnb, double sinr) {
+            E2KpmReport r{};
+            r.timestamp = Simulator::Now().GetSeconds();
+            r.gnbId = gnb;
+            r.isNtn = true;
+            r.ueId = ueId;
+            r.sinr_dB = sinr;
+            r.rsrp_dBm = -90.0;
+            r.tte_s = 120.0;
+            r.elevation_deg = 35.0;
+            r.doppler_Hz = 1000.0;
+            r.beamId = gnb;
+            xapp->HandleKpmIndication(1, r);
+        };
+        feed(targetGnb, candSinr);
+        feed(servingGnb, servingSinr);
+        // Publish the true serving cell by identity (not gnbId order).
+        xapp->SetUeServingCell(ueId, servingGnb);
+
+        gym->SetCurrentUe(ueId);
+
+        // GetObservation() latches m_preActionSinr and exposes serving/candidate
+        // SINR in the box (index 0 = servingSinr, index 5 = bestCandSinr).
+        auto obs = gym->GetObservation();
+        auto box = DynamicCast<OpenGymBoxContainer<float>>(obs);
+        NS_TEST_ASSERT_MSG_NE(box, nullptr,
+                              "Observation must be a float box container");
+        float obsServingSinr = box->GetValue(0);
+        float obsBestCandSinr = box->GetValue(5);
+
+        NS_TEST_ASSERT_MSG_EQ_TOL(obsServingSinr, static_cast<float>(servingSinr),
+                                  0.5f,
+                                  "Pre-action serving SINR must reflect the low "
+                                  "serving report (~3 dB)");
+        NS_TEST_ASSERT_MSG_EQ_TOL(obsBestCandSinr, static_cast<float>(candSinr),
+                                  0.5f,
+                                  "Best-candidate SINR must reflect the high "
+                                  "candidate report (~15 dB)");
+        NS_TEST_ASSERT_MSG_GT(obsBestCandSinr, obsServingSinr,
+                              "RL observation exposes a candidate whose SINR "
+                              "exceeds the serving cell (positive delta)");
+
+        // Discrete action = 1 -> handover to first candidate (the high-SINR gnb).
+        auto act = CreateObject<OpenGymDiscreteContainer>(5);
+        act->SetValue(1);
+        bool ok = gym->ExecuteActions(act);
+        NS_TEST_ASSERT_MSG_EQ(ok, true,
+                              "ExecuteActions must accept the discrete RL action");
+
+        Simulator::Stop(Seconds(1));
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(m_fireCount, 1u,
+                              "RL handover must actuate exactly once at the "
+                              "target E2 node");
+        NS_TEST_ASSERT_MSG_EQ(m_actuatedGnb, targetGnb,
+                              "RL action must actuate a handover toward the "
+                              "high-SINR gnb 2");
+        NS_TEST_ASSERT_MSG_EQ(m_actuatedUe, ueId,
+                              "Actuated handover must carry the current UE id");
+        NS_TEST_ASSERT_MSG_GT(candSinr, servingSinr,
+                              "Chosen candidate SINR must exceed the pre-action "
+                              "serving SINR (RL moves the UE to higher SINR)");
+
+        gym->Dispose();
+        ric->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// ============================================================================
+//  WS-B / D2: the OranNtnHelper actuator hooks (RegisterBeamLossModel,
+//  SetHandoverActuator) must be CALLABLE and actuate the real radio through the
+//  full RIC -> E2 termination -> E2 node -> DefaultRcActionHandler path. Before
+//  this, those hooks had zero callers and the generic RC path was "logged only,
+//  actuated=false" (a decision island). This drives one BEAM_SWITCH and one
+//  HANDOVER_TRIGGER end-to-end and asserts real actuation:
+//    - the beam action rewrites the live channel loss model to -gain (the same
+//      recipe as the oran-ntn-ric-controlled-traffic reference loop), and
+//    - the handover action reaches the wired actuator with the correct target.
+// ============================================================================
+class OranNtnHelperActuatorsWiredTest : public TestCase
+{
+  public:
+    OranNtnHelperActuatorsWiredTest()
+        : TestCase("WS-B D2 - OranNtnHelper beam + handover actuators actuate through the RC path")
+    {
+    }
+
+  private:
+    uint32_t m_hoFire{0};
+    uint32_t m_hoTargetGnb{0};
+    uint32_t m_hoTargetUe{0};
+
+    bool HoActuator(E2RcAction a)
+    {
+        m_hoFire++;
+        m_hoTargetGnb = a.targetGnbId;
+        m_hoTargetUe = a.targetUeId;
+        return true;
+    }
+
+    void DoRun() override
+    {
+        auto ric = CreateObject<OranNtnNearRtRic>();
+        ric->Initialize();
+
+        // Helper must outlive Simulator::Run() — its E2 nodes hold a callback to
+        // OranNtnHelper::DefaultRcActionHandler.
+        OranNtnHelper helper;
+        NodeContainer sats;
+        sats.Create(2);
+        auto e2nodes = helper.CreateSatelliteE2Nodes(sats, ric); // ids 1,2 -> DefaultRcActionHandler
+
+        // D2 (beam): register a REAL channel loss model on gNB 1.
+        auto beamModel = CreateObject<NtnStaticExtraLossModel>();
+        helper.RegisterBeamLossModel(1, beamModel);
+
+        // D2 (handover): wire the handover actuator (stands in for
+        // NtnRealStackHelper::TriggerHandover).
+        helper.SetHandoverActuator(
+            MakeCallback(&OranNtnHelperActuatorsWiredTest::HoActuator, this));
+
+        auto xapp = CreateObject<OranNtnXappHoPredict>();
+        xapp->SetXappName("ws-b-actuator");
+        ric->RegisterXapp(xapp);
+
+        const double beamGainDb = 15.0;
+        E2RcAction beam{};
+        beam.actionType = E2RcActionType::BEAM_SWITCH;
+        beam.targetGnbId = 1;
+        beam.parameter1 = beamGainDb;
+        beam.timestamp = Simulator::Now().GetSeconds();
+        beam.xappId = xapp->GetXappId();
+        beam.xappName = "ws-b-actuator";
+        xapp->SubmitAction(beam);
+
+        E2RcAction ho{};
+        ho.actionType = E2RcActionType::HANDOVER_TRIGGER;
+        ho.targetGnbId = 2;
+        ho.targetUeId = 5;
+        ho.timestamp = Simulator::Now().GetSeconds();
+        ho.xappId = xapp->GetXappId();
+        ho.xappName = "ws-b-actuator";
+        xapp->SubmitAction(ho);
+
+        Simulator::Stop(Seconds(1));
+        Simulator::Run();
+
+        // Beam actuation is REAL: a live channel reconfiguration to -gain (negative
+        // loss = array gain), visible to the measured plane.
+        NS_TEST_ASSERT_MSG_EQ_TOL(beamModel->GetLossDb(), -beamGainDb, 1e-9,
+                                  "BEAM_SWITCH must rewrite the live channel loss to -gain");
+        // Handover actuation reaches the wired actuator with the correct target —
+        // no longer "logged only, not actuated".
+        NS_TEST_ASSERT_MSG_EQ(m_hoFire, 1u, "handover actuator must fire exactly once");
+        NS_TEST_ASSERT_MSG_EQ(m_hoTargetGnb, 2u, "handover actuator target gNB must be 2");
+        NS_TEST_ASSERT_MSG_EQ(m_hoTargetUe, 5u, "handover actuator target UE must be 5");
+
+        Simulator::Destroy();
+    }
+};
+
+// ============================================================================
+//  WS-C: the digital-twin C++ consumer must CLOSE the loop — a twin-exported
+//  handover prediction, loaded from a file, must actuate a real handover inside
+//  the running sim at the predicted time. This writes a 1-line prediction file,
+//  loads it, wires the consumer's submit callback to an xApp -> RIC -> E2 node,
+//  and asserts the E2 node's RC actuation fires at the predicted time with the
+//  twin's recommended target. Also checks the Non-RT GetRecommendation() query.
+// ============================================================================
+class OranNtnTwinConsumerClosesLoopTest : public TestCase
+{
+  public:
+    OranNtnTwinConsumerClosesLoopTest()
+        : TestCase("WS-C - digital twin prediction consumer actuates a handover into the E2 loop")
+    {
+    }
+
+  private:
+    Ptr<OranNtnXappHoPredict> m_xapp;
+    uint32_t m_rcFire{0};
+    uint32_t m_rcUe{0};
+    uint32_t m_rcGnb{0};
+    double m_rcTime{-1.0};
+
+    // Twin prediction -> submit a HANDOVER_TRIGGER through the xApp (the real
+    // path: xApp -> RIC -> E2 termination -> E2 node RC callback).
+    void SubmitViaXapp(uint32_t ueId, uint32_t gnbId, double conf)
+    {
+        E2RcAction a{};
+        a.actionType = E2RcActionType::HANDOVER_TRIGGER;
+        a.targetGnbId = gnbId;
+        a.targetUeId = ueId;
+        a.confidence = conf;
+        a.timestamp = Simulator::Now().GetSeconds();
+        a.xappId = m_xapp->GetXappId();
+        a.xappName = "twin-consumer";
+        m_xapp->SubmitAction(a);
+    }
+
+    bool CaptureRc(E2RcAction a)
+    {
+        m_rcFire++;
+        m_rcUe = a.targetUeId;
+        m_rcGnb = a.targetGnbId;
+        m_rcTime = Simulator::Now().GetSeconds();
+        return true;
+    }
+
+    void DoRun() override
+    {
+        const std::string path = "twin-predictions-wsc-test.txt";
+        {
+            std::ofstream f(path);
+            f << "# ntn-twin handover predictions  epoch_unix=1735689600\n";
+            f << "# t_s,ueId,recommendedGnbId,confidence\n";
+            f << "30.0,0,2,0.94\n";
+            f << "10.0,0,2,0.20\n"; // low confidence: must be filtered out by minConfidence
+            f.close();
+        }
+
+        const Time feederDelay = MilliSeconds(4);
+        auto ric = CreateObject<OranNtnNearRtRic>();
+        ric->Initialize();
+
+        auto e2 = CreateObject<OranNtnE2Node>();
+        e2->SetNodeId(2);
+        e2->SetIsNtn(true);
+        e2->SetFeederLinkDelay(feederDelay);
+        e2->RegisterRanFunction(3, "RC");
+        e2->SetRcActionCallback(
+            MakeCallback(&OranNtnTwinConsumerClosesLoopTest::CaptureRc, this));
+        ric->ConnectE2Node(e2);
+
+        m_xapp = CreateObject<OranNtnXappHoPredict>();
+        m_xapp->SetXappName("twin-consumer");
+        ric->RegisterXapp(m_xapp);
+
+        auto consumer = CreateObject<OranNtnTwinPredictionConsumer>();
+        uint32_t n = consumer->LoadPredictionsFromFile(path);
+        NS_TEST_ASSERT_MSG_EQ(n, 2u, "both predictions must load from the file");
+        NS_TEST_ASSERT_MSG_EQ(consumer->GetNumPredictions(), 2u, "two predictions held");
+
+        // Only confidence >= 0.5 fires: the 0.20 one at t=10 is filtered out.
+        consumer->Start(
+            MakeCallback(&OranNtnTwinConsumerClosesLoopTest::SubmitViaXapp, this), 0.5);
+
+        Simulator::Stop(Seconds(31));
+        Simulator::Run();
+
+        // The high-confidence prediction closed the loop: exactly one handover
+        // actuated at the E2 node, at the predicted time (+ feeder delay), to the
+        // twin's recommended cell.
+        NS_TEST_ASSERT_MSG_EQ(consumer->GetActuatedCount(), 1u,
+                              "only the high-confidence prediction should actuate");
+        NS_TEST_ASSERT_MSG_EQ(m_rcFire, 1u, "E2 node RC callback must fire once");
+        NS_TEST_ASSERT_MSG_EQ(m_rcGnb, 2u, "handover target must be the twin's recommended gNB 2");
+        NS_TEST_ASSERT_MSG_EQ(m_rcUe, 0u, "handover UE must be 0");
+        NS_TEST_ASSERT_MSG_GT_OR_EQ(m_rcTime, 30.0,
+                                    "actuation must occur at/after the predicted time (30 s)");
+        NS_TEST_ASSERT_MSG_LT(m_rcTime, 30.5,
+                              "actuation must occur near the predicted time + feeder delay");
+
+        // Non-RT policy query: at t=35 s the t=30 prediction applies.
+        uint32_t recGnb = 0;
+        double recConf = 0.0;
+        bool have = consumer->GetRecommendation(0, Seconds(35.0), recGnb, recConf);
+        NS_TEST_ASSERT_MSG_EQ(have, true, "a recommendation must exist for UE 0 at t=35 s");
+        NS_TEST_ASSERT_MSG_EQ(recGnb, 2u, "recommended cell must be 2");
+
+        Simulator::Destroy();
+        std::remove(path.c_str());
+    }
+};
+
+// ============================================================================
 //  Test Suite Registration
 // ============================================================================
 
@@ -4957,6 +5487,15 @@ class OranNtnTestSuite : public TestSuite
         AddTestCase(new OranNtnMmimoXappSimulatorTimeTest,
                     TestCase::Duration::QUICK);
         AddTestCase(new OranNtnMmimoXappFailureModesTest,
+                    TestCase::Duration::QUICK);
+        // O-RAN actuation closed-loop gates (decision -> actuation).
+        AddTestCase(new OranNtnXappMovesServingCellTest,
+                    TestCase::Duration::QUICK);
+        AddTestCase(new OranNtnRlActionImprovesSinrTest,
+                    TestCase::Duration::QUICK);
+        AddTestCase(new OranNtnHelperActuatorsWiredTest,
+                    TestCase::Duration::QUICK);
+        AddTestCase(new OranNtnTwinConsumerClosesLoopTest,
                     TestCase::Duration::QUICK);
     }
 };

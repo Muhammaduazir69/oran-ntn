@@ -13,6 +13,8 @@
 #include <ns3/simulator.h>
 #include <ns3/uinteger.h>
 
+#include <limits>
+
 namespace ns3
 {
 
@@ -276,6 +278,74 @@ OranNtnXappBase::GetUeReportsInWindow(uint32_t ueId, Time window) const
     return result;
 }
 
+void
+OranNtnXappBase::SetUeServingCell(uint32_t ueId, uint32_t gnbId)
+{
+    m_ueServingCell[ueId] = gnbId;
+}
+
+bool
+OranNtnXappBase::GetUeServingCell(uint32_t ueId, uint32_t& gnbId) const
+{
+    auto it = m_ueServingCell.find(ueId);
+    if (it == m_ueServingCell.end())
+    {
+        return false;
+    }
+    gnbId = it->second;
+    return true;
+}
+
+E2KpmReport
+OranNtnXappBase::GetUeServingReport(uint32_t ueId, Time window, bool& found) const
+{
+    found = false;
+    E2KpmReport serving{};
+    uint32_t servingGnb = 0;
+    bool haveServing = GetUeServingCell(ueId, servingGnb);
+
+    // Pass 1: newest report from the KNOWN serving cell.
+    // Pass 2 (fallback): newest report from any cell — by timestamp, never by
+    // gnbId map order.
+    double bestServingTs = -std::numeric_limits<double>::infinity();
+    double bestAnyTs = -std::numeric_limits<double>::infinity();
+    E2KpmReport newestAny{};
+    bool haveAny = false;
+    double now = Simulator::Now().GetSeconds();
+    double windowSec = window.GetSeconds();
+
+    for (const auto& [gnbId, reports] : m_kpmDatabase)
+    {
+        for (const auto& r : reports)
+        {
+            if (r.ueId != ueId || (now - r.timestamp) > windowSec)
+            {
+                continue;
+            }
+            if (r.timestamp > bestAnyTs)
+            {
+                bestAnyTs = r.timestamp;
+                newestAny = r;
+                haveAny = true;
+            }
+            if (haveServing && gnbId == servingGnb && r.timestamp > bestServingTs)
+            {
+                bestServingTs = r.timestamp;
+                serving = r;
+                found = true;
+            }
+        }
+    }
+
+    if (found)
+    {
+        return serving;
+    }
+    // Serving cell unknown or has no report in window: newest report overall.
+    found = haveAny;
+    return newestAny;
+}
+
 // ---- A1 policy ----
 
 std::vector<A1Policy>
@@ -305,21 +375,74 @@ OranNtnXappBase::CheckPolicyCompliance(const E2RcAction& action) const
     auto a1Adapter = m_ric->GetA1Adapter();
     auto policies = a1Adapter->GetActivePolicies();
 
+    // Only HANDOVER_TRIGGER actions are governed by HO_THRESHOLD policies here.
+    if (action.actionType != E2RcActionType::HANDOVER_TRIGGER)
+    {
+        return true;
+    }
+
+    const Time now = Simulator::Now();
+
     for (const auto& policy : policies)
     {
-        if (policy.type == A1PolicyType::HO_THRESHOLD &&
-            action.actionType == E2RcActionType::HANDOVER_TRIGGER)
+        if (policy.type != A1PolicyType::HO_THRESHOLD || !policy.active)
         {
-            // Check max handover rate if specified
-            if (policy.maxHandoverRate > 0)
+            continue;
+        }
+
+        // Action semantics (see OranNtnXappHoPredict::BuildAction):
+        //   parameter1 = candidate-cell SINR (dB)
+        //   parameter2 = candidate-cell TTE (s)
+        // Policy semantics (see OranNtnA1PolicyManager::GenerateOrbitAwarePolicies):
+        //   param1 = minimum acceptable TTE (s)
+        //   param2 = minimum acceptable SINR threshold (dB)
+        const double candSinrDb = action.parameter1;
+        const double candTteS = action.parameter2;
+
+        // (1) SINR-threshold check: reject a HO onto a target below the A1 SINR
+        //     floor (would trade a working link for a weaker one).
+        if (candSinrDb < policy.param2)
+        {
+            NS_LOG_INFO("xApp " << m_xappName << ": HANDOVER_TRIGGER rejected -- "
+                        "candidate SINR " << candSinrDb << " dB < A1 threshold "
+                        << policy.param2 << " dB (policy " << policy.policyId << ")");
+            return false;
+        }
+
+        // (2) TTE-threshold check: reject a HO onto a target that will not stay
+        //     in coverage long enough (candidate TTE below the A1 minimum).
+        if (candTteS < policy.param1)
+        {
+            NS_LOG_INFO("xApp " << m_xappName << ": HANDOVER_TRIGGER rejected -- "
+                        "candidate TTE " << candTteS << " s < A1 minimum "
+                        << policy.param1 << " s (policy " << policy.policyId << ")");
+            return false;
+        }
+
+        // (3) HO-rate check: enforce A1NtnPolicy::maxHandoverRate (HO per minute)
+        //     over a sliding 60 s window of previously-accepted HOs.
+        if (policy.maxHandoverRate > 0.0)
+        {
+            const Time window = Seconds(60.0);
+            while (!m_recentHoTimes.empty() && (now - m_recentHoTimes.front()) > window)
             {
-                // Count recent HO actions from this xApp
-                // (simplified check - in production this would be more sophisticated)
+                m_recentHoTimes.pop_front();
+            }
+            if (static_cast<double>(m_recentHoTimes.size()) >= policy.maxHandoverRate)
+            {
+                NS_LOG_INFO("xApp " << m_xappName << ": HANDOVER_TRIGGER rejected -- "
+                            "HO rate " << m_recentHoTimes.size() << "/min reached A1 cap "
+                            << policy.maxHandoverRate << "/min (policy "
+                            << policy.policyId << ")");
+                return false;
             }
         }
     }
 
-    return true; // Default: compliant
+    // Compliant with every HO_THRESHOLD policy: record this HO so it counts
+    // toward the rate limit for subsequent decisions.
+    m_recentHoTimes.push_back(now);
+    return true;
 }
 
 // ---- RC action submission ----
