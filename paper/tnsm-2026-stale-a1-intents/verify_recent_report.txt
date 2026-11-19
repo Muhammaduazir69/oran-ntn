@@ -1,0 +1,102 @@
+ok   onboard 550/1: ten seeds
+ok   RecSpaceOranFiveGOneShort = 5.7 vs 5.7106
+ok   RecSpaceOranFiveGOneNfMiss = 0.00 vs 0.0019
+ok   RecSpaceOranFiveGOneOver = 0.36 vs 0.3638
+ok   pal 550/1: ten seeds
+ok   RecPalFiveGOneShort = 3.3 vs 3.2556
+ok   RecPalFiveGOneNfMiss = 0.18 vs 0.1789
+ok   RecPalFiveGOneOver = 1.67 vs 1.6693
+ok   pred-ho 550/1: ten seeds
+ok   RecBarandaFiveGOneShort = 5.7 vs 5.7403
+ok   RecBarandaFiveGOneNfMiss = 0.19 vs 0.1873
+ok   RecBarandaFiveGOneOver = 0.36 vs 0.3633
+ok   ground-pre 550/1: ten seeds
+ok   RecKubeFiveGOneShort = 8.3 vs 8.2594
+ok   RecKubeFiveGOneNfMiss = 19.57 vs 19.5699
+ok   RecKubeFiveGOneOver = 0.71 vs 0.7065
+ok   RecDSpaceOranFiveGOneShort = \ensuremath{-}2.46 vs -2.4550
+ok   RecDSpaceOranFiveGOneShortNpos
+ok   RecCutSpaceOranFiveGOneShort = 43 vs 42.9906
+ok   RecDSpaceOranFiveGOneShortP
+ok   RecDBarandaFiveGOneShort = \ensuremath{-}2.48 vs -2.4847
+ok   RecDBarandaFiveGOneShortNpos
+ok   RecCutBarandaFiveGOneShort = 43 vs 43.2857
+ok   RecDBarandaFiveGOneShortP
+ok   RecDKubeFiveGOneShort = \ensuremath{-}5.00 vs -5.0039
+ok   RecDKubeFiveGOneShortNpos
+ok   RecCutKubeFiveGOneShort = 61 vs 60.5839
+ok   RecDKubeFiveGOneShortP
+ok   onboard 550/2: ten seeds
+ok   RecSpaceOranFiveGTwoShort = 5.1 vs 5.0583
+ok   RecSpaceOranFiveGTwoNfMiss = 0.00 vs 0.0019
+ok   RecSpaceOranFiveGTwoOver = 0.35 vs 0.3464
+ok   pal 550/2: ten seeds
+ok   RecPalFiveGTwoShort = 3.3 vs 3.3258
+ok   RecPalFiveGTwoNfMiss = 0.18 vs 0.1762
+ok   RecPalFiveGTwoOver = 1.56 vs 1.5561
+ok   pred-ho 550/2: ten seeds
+ok   RecBarandaFiveGTwoShort = 5.2 vs 5.1633
+ok   RecBarandaFiveGTwoNfMiss = 0.20 vs 0.1953
+ok   RecBarandaFiveGTwoOver = 0.35 vs 0.3489
+ok   ground-pre 550/2: ten seeds
+ok   RecKubeFiveGTwoShort = 7.9 vs 7.8933
+ok   RecKubeFiveGTwoNfMiss = 18.82 vs 18.8244
+ok   RecKubeFiveGTwoOver = 0.64 vs 0.6449
+ok   RecDSpaceOranFiveGTwoShort = \ensuremath{-}1.73 vs -1.7325
+ok   RecDSpaceOranFiveGTwoShortNpos
+ok   RecCutSpaceOranFiveGTwoShort = 34 vs 34.2504
+ok   RecDBarandaFiveGTwoShort = \ensuremath{-}1.84 vs -1.8375
+ok   RecDBarandaFiveGTwoShortNpos
+ok   RecCutBarandaFiveGTwoShort = 36 vs 35.5875
+ok   RecDKubeFiveGTwoShort = \ensuremath{-}4.57 vs -4.5675
+ok   RecDKubeFiveGTwoShortNpos
+ok   RecCutKubeFiveGTwoShort = 58 vs 57.8653
+ok   onboard 1200/1: ten seeds
+ok   RecSpaceOranTwelveGOneShort = 4.2 vs 4.2358
+ok   RecSpaceOranTwelveGOneNfMiss = 0.00 vs 0.0008
+ok   RecSpaceOranTwelveGOneOver = 0.30 vs 0.2980
+ok   pal 1200/1: ten seeds
+ok   RecPalTwelveGOneShort = 3.2 vs 3.1689
+ok   RecPalTwelveGOneNfMiss = 0.20 vs 0.1989
+ok   RecPalTwelveGOneOver = 0.84 vs 0.8440
+ok   pred-ho 1200/1: ten seeds
+ok   RecBarandaTwelveGOneShort = 4.3 vs 4.3042
+ok   RecBarandaTwelveGOneNfMiss = 0.19 vs 0.1939
+ok   RecBarandaTwelveGOneOver = 0.30 vs 0.2999
+ok   ground-pre 1200/1: ten seeds
+ok   RecKubeTwelveGOneShort = 5.8 vs 5.8350
+ok   RecKubeTwelveGOneNfMiss = 10.93 vs 10.9289
+ok   RecKubeTwelveGOneOver = 0.60 vs 0.5979
+ok   RecDSpaceOranTwelveGOneShort = \ensuremath{-}1.07 vs -1.0669
+ok   RecDSpaceOranTwelveGOneShortNpos
+ok   RecCutSpaceOranTwelveGOneShort = 25 vs 25.1885
+ok   RecDBarandaTwelveGOneShort = \ensuremath{-}1.14 vs -1.1353
+ok   RecDBarandaTwelveGOneShortNpos
+ok   RecCutBarandaTwelveGOneShort = 26 vs 26.3762
+ok   RecDKubeTwelveGOneShort = \ensuremath{-}2.67 vs -2.6661
+ok   RecDKubeTwelveGOneShortNpos
+ok   RecCutKubeTwelveGOneShort = 46 vs 45.6917
+ok   RecCutMin = 25 vs 25.1885
+ok   RecCutMax = 43 vs 43.2857
+ok   pred-ho seed01: hand-offs, never on the safe intent
+ok   pred-ho seed02: hand-offs, never on the safe intent
+ok   pred-ho seed03: hand-offs, never on the safe intent
+ok   pred-ho seed04: hand-offs, never on the safe intent
+ok   pred-ho seed05: hand-offs, never on the safe intent
+ok   pred-ho seed06: hand-offs, never on the safe intent
+ok   pred-ho seed07: hand-offs, never on the safe intent
+ok   pred-ho seed08: hand-offs, never on the safe intent
+ok   pred-ho seed09: hand-offs, never on the safe intent
+ok   pred-ho seed10: hand-offs, never on the safe intent
+ok   ground-pre seed01: provisioned, never on board
+ok   ground-pre seed02: provisioned, never on board
+ok   ground-pre seed03: provisioned, never on board
+ok   ground-pre seed04: provisioned, never on board
+ok   ground-pre seed05: provisioned, never on board
+ok   ground-pre seed06: provisioned, never on board
+ok   ground-pre seed07: provisioned, never on board
+ok   ground-pre seed08: provisioned, never on board
+ok   ground-pre seed09: provisioned, never on board
+ok   ground-pre seed10: provisioned, never on board
+
+100 checks, 0 failed

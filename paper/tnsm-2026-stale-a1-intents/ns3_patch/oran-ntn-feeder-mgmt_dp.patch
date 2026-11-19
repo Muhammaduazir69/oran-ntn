@@ -1,0 +1,799 @@
+--- orig/oran-ntn-feeder-mgmt.cc	2026-11-03 23:58:18.935741290 +0500
++++ oran-ntn-feeder-mgmt_dp.cc	2026-11-09 15:23:42.279357623 +0500
+@@ -102,6 +102,8 @@
+ #include <memory>
+ #include <numeric>
+ #include <set>
++#include <sstream>
++#include <utility>
+ #include <string>
+ #include <vector>
+ 
+@@ -241,7 +243,8 @@
+     double hbPeriodS{0.1};
+     uint32_t hbMiss{3};
+     double leadS{2.0};
+-    double maxLeaseS{300.0};
++    double maxLeaseS{3600.0};  // large enough not to bind in the T_A1 sweep
++    double fixedLeaseS{-1.0};  // fixed lease timer (s); <0 uses the rule
+     double leaseEps{0.2};      // supersession bound for the lease horizon
+     double priorUpdateS{60.0}; // prior for the RIC's update-interval estimate
+     double preS{60.0};
+@@ -269,6 +272,30 @@
+     double a1BurstCv2{4.0};    // squared coefficient of variation, bursty process
+     double nfAccGround{0.90};  // decision accuracy of the full (ground) NF xApp
+     uint32_t numBeams{16};
++    bool nfPinOnboard{false};  // PAL with the host test of the break-even: NF stays on board
++    double beamCv2{1.0};       // squared CV of the dwell of the best beam (1 = Poisson)
++    double beamDrift{0.5};     // probability that a jump repeats the last direction
++    double errRho{0.0};        // correlation of consecutive decision outcomes
++    bool a1Step{false};        // a new intent moves one step in the alphabet, not a redraw
++    bool oracleIntent{false};  // control arm: on-board decisions always see the current intent
++    bool surge{false};         // intents linked to demand through a two-state regime
++    double surgeLeadS{2.0};    // the rApp knows the regime this long ahead
++    double surgeDwellS{-1.0};  // regime dwell apart from the update spacing; <0 ties it to a1MeanS
++    double surgeDuty{0.5};     // share of time in a surge
++    bool surgeUnlinked{false}; // surges on, intents redrawn independently of them
++    double initG{0.3};         // first intent (version 1), which every satellite holds from launch
++    double initH{0.2};
++    bool provisionAll{false};  // push A1 versions to every satellite whose feeder is up, not only the serving one
++    uint32_t surgeSessions{10};
++    double surgeHighG{0.8};
++    double surgeLowG{0.2};
++    double surgeH{0.1};
++    bool dataPlane{false};
++    bool workConserving{false}; // BE may use critical budget left idle in a TTI
++    double cellMbps{10.0};
++    uint32_t pktBytes{1250};
++    double critDeadlineS{0.1};
++    std::string gwList{};      // "lat:lon,lat:lon,...": replaces the gateway list; RIC at the first
+     std::string outDir{"oran-ntn-feeder-mgmt-output"};
+     uint32_t run{1};
+ };
+@@ -284,7 +311,7 @@
+     double lon;
+ };
+ 
+-const GwSite kGw[4] = {
++GwSite kGw[4] = {
+     {"Karachi", 24.86, 67.01},
+     {"Muscat", 23.59, 58.41},
+     {"Mumbai", 19.08, 72.88},
+@@ -292,8 +319,8 @@
+ };
+ 
+ // Near-RT RIC site: regional edge cloud in Karachi.
+-const double kRicLat = 24.86;
+-const double kRicLon = 67.01;
++double kRicLat = 24.86;
++double kRicLon = 67.01;
+ 
+ // ---------------------------------------------------------------------------
+ // State
+@@ -425,6 +452,7 @@
+ };
+ std::vector<ServeSeg> serveTl;
+ int servingIdx = -1; // sats[] index currently serving
++uint32_t surgeActive = 0;
+ size_t serveSeg = 0;
+ 
+ Ptr<Node> smoNode, ricNode;
+@@ -505,8 +533,10 @@
+ const double kGap[kNG] = {0.0, 0.005, 0.01, 0.015, 0.02, 0.03, 0.05, 0.10};
+ int bestBeam[kNT] = {0, 0, 0, 0};
+ int appliedBeam[kNT][kNG];
+-uint64_t beamMis[kNT][kNG];
+-uint64_t beamSamp = 0;
++double beamMisS[kNT][kNG];
++double beamServedS = 0;
++int64_t beamLastNs = 0;
++int beamDir[kNT] = {1, 1, 1, 1};
+ int64_t lastNfAppliedNs = -1;
+ Ptr<UniformRandomVariable> rvBeam, rvDec;
+ std::map<int64_t, std::array<int, kNT>> nfMeasured; // NF epoch -> measured best beams
+@@ -519,9 +549,12 @@
+     return (m + (u < 0.5 ? 1 : B - 1)) % B;
+ }
+ 
++void BeamAccrue();
++
+ void
+ ResetAppliedBeams()
+ {
++    BeamAccrue();
+     for (int i = 0; i < kNT; ++i)
+     {
+         for (int j = 0; j < kNG; ++j)
+@@ -532,56 +565,107 @@
+     lastNfAppliedNs = -1;
+ }
+ 
++// Event-driven beam outcome: the applied and the best beam change only at
++// events, and the misaligned time is integrated exactly between them, so no
++// grid couples the age difference between hosts to the phase of the NF epochs.
+ void
+-BeamTick()
++BeamAccrue()
+ {
+-    Simulator::Schedule(MilliSeconds(10), &BeamTick);
+-    const int B = static_cast<int>(g.numBeams);
+-    for (int i = 0; i < kNT; ++i)
+-    {
+-        const double u = rvBeam->GetValue();
+-        const double d = rvBeam->GetValue();
+-        if (u < 1.0 - std::exp(-0.01 / kDwell[i]))
+-        {
+-            bestBeam[i] = (bestBeam[i] + (d < 0.5 ? 1 : B - 1)) % B;
+-        }
+-    }
+-    if (servingIdx < 0)
++    const int64_t now = Simulator::Now().GetNanoSeconds();
++    const double dt = (now - beamLastNs) * 1e-9;
++    beamLastNs = now;
++    if (servingIdx < 0 || dt <= 0)
+     {
+         return;
+     }
+-    ++beamSamp;
++    beamServedS += dt;
+     for (int i = 0; i < kNT; ++i)
+     {
+         for (int j = 0; j < kNG; ++j)
+         {
+             if (appliedBeam[i][j] != bestBeam[i])
+             {
+-                ++beamMis[i][j];
++                beamMisS[i][j] += dt;
+             }
+         }
+     }
+-    // forget decisions of epochs that can no longer be applied in time
+-    if (beamSamp % 100 == 0)
++}
++
++// Next dwell of the best beam, mean kDwell[i]: exponential by default, Erlang
++// (squared CV below 1) or balanced hyperexponential (above 1) as stress cases.
++double
++BeamGap(int i)
++{
++    const double T = kDwell[i];
++    auto ex = [&]() { return -std::log(1.0 - rvBeam->GetValue()); };
++    if (g.beamCv2 < 1.0)
+     {
+-        const int64_t cut = (Simulator::Now() - Seconds(5)).GetNanoSeconds();
+-        while (!nfMeasured.empty() && nfMeasured.begin()->first < cut)
++        const int k = std::max(1, static_cast<int>(std::lround(1.0 / g.beamCv2)));
++        double x = 0;
++        for (int n = 0; n < k; ++n)
+         {
+-            nfMeasured.erase(nfMeasured.begin());
+-        }
+-        while (!rcBeam.empty() && rcBeam.begin()->first < cut)
+-        {
+-            rcBeam.erase(rcBeam.begin());
++            x += ex();
+         }
++        return T * x / k;
++    }
++    if (g.beamCv2 > 1.0)
++    {
++        const double p1 = 0.5 * (1.0 + std::sqrt((g.beamCv2 - 1.0) / (g.beamCv2 + 1.0)));
++        const bool first = rvBeam->GetValue() < p1;
++        return ex() * (first ? T / (2.0 * p1) : T / (2.0 * (1.0 - p1)));
++    }
++    return T * ex();
++}
++
++void
++BeamJump(int i)
++{
++    BeamAccrue();
++    const int B = static_cast<int>(g.numBeams);
++    if (rvBeam->GetValue() >= g.beamDrift)
++    {
++        beamDir[i] = -beamDir[i];
+     }
++    bestBeam[i] = (bestBeam[i] + (beamDir[i] > 0 ? 1 : B - 1)) % B;
++    Simulator::Schedule(Seconds(BeamGap(i)), &BeamJump, i);
++}
++
++// Forget decisions of epochs that can no longer be applied in time.
++void
++BeamCleanup()
++{
++    Simulator::Schedule(Seconds(1), &BeamCleanup);
++    const int64_t cut = (Simulator::Now() - Seconds(5)).GetNanoSeconds();
++    while (!nfMeasured.empty() && nfMeasured.begin()->first < cut)
++    {
++        nfMeasured.erase(nfMeasured.begin());
++    }
++    while (!rcBeam.empty() && rcBeam.begin()->first < cut)
++    {
++        rcBeam.erase(rcBeam.begin());
++    }
++}
++
++// Decision outcome: uniform marginals, reused with probability errRho, so a
++// wrong pick can persist while the accuracy of each decision stays the same.
++std::pair<double, double>
++DecisionDraw()
++{
++    static double lastX = 0.5;
++    static double lastU = 0.5;
++    if (g.errRho <= 0.0 || rvDec->GetValue() >= g.errRho)
++    {
++        lastX = rvDec->GetValue();
++        lastU = rvDec->GetValue();
++    }
++    return {lastX, lastU};
+ }
+ 
+ // Ground (full xApp) decision for an NF epoch from the measured beams.
+ std::array<int, kNT>
+ GroundBeamDecision(const std::array<int, kNT>& m)
+ {
+-    const double x = rvDec->GetValue();
+-    const double u = rvDec->GetValue();
++    const auto [x, u] = DecisionDraw();
+     std::array<int, kNT> d{};
+     for (int i = 0; i < kNT; ++i)
+     {
+@@ -605,6 +689,7 @@
+         {
+             return;
+         }
++        BeamAccrue();
+         for (int i = 0; i < kNT; ++i)
+         {
+             for (int j = 0; j < kNG; ++j)
+@@ -621,8 +706,8 @@
+             return;
+         }
+         ++st.nfOnbDecisions;
+-        const double x = rvDec->GetValue();
+-        const double u = rvDec->GetValue();
++        const auto [x, u] = DecisionDraw();
++        BeamAccrue();
+         for (int i = 0; i < kNT; ++i)
+         {
+             for (int j = 0; j < kNG; ++j)
+@@ -654,7 +739,7 @@
+ double
+ Demand()
+ {
+-    return std::min(0.9, g.sessionShare * sessions);
++    return std::min(0.9, g.sessionShare * (sessions + surgeActive));
+ }
+ 
+ double
+@@ -1049,7 +1134,7 @@
+         // PAL pins RT on board: the placement rule is evaluated for RT every
+         // tick and logged (checks.csv); it never selects the ground for RT in
+         // the evaluated geometries.
+-        return cls == kRT || s.leased[cls] || s.autonomous;
++        return cls == kRT || (g.nfPinOnboard && cls == kNF) || s.leased[cls] || s.autonomous;
+     }
+ }
+ 
+@@ -1239,7 +1324,7 @@
+         uint32_t ver = 0;
+         if (cls == kNS)
+         {
+-            const Policy p = FromA1(*sat.a1);
++            const Policy p = g.oracleIntent ? smoCur : FromA1(*sat.a1);
+             value = Decide(demand, p);
+             ver = p.ver;
+         }
+@@ -1371,7 +1456,7 @@
+     case Strategy::SatPred:
+         return cls != kRT;
+     default:
+-        return cls != kRT; // pal: RT is never placed on the ground (predicted loop > 10 ms)
++        return cls != kRT && !(g.nfPinOnboard && cls == kNF); // pal: RT is never placed on the ground (predicted loop > 10 ms)
+     }
+ }
+ 
+@@ -1485,7 +1570,14 @@
+ Time
+ LeaseTau()
+ {
+-    const double meanS = (g.priorUpdateS + a1IntervalSum) / (1.0 + a1IntervalN);
++    if (g.fixedLeaseS >= 0)
++    {
++        return Seconds(g.fixedLeaseS);
++    }
++    // Gamma-exponential posterior mean over all exposure so far, so a quiet
++    // spell raises the estimate; the prior weighs as one observation.
++    const double seen = a1IntervalN + (a1LastAt >= 0 ? 1.0 : 0.0);
++    const double meanS = (g.priorUpdateS + Simulator::Now().GetSeconds()) / (1.0 + seen);
+     return std::min(L::LeaseHorizon(Seconds(meanS), g.leaseEps), Seconds(g.maxLeaseS));
+ }
+ 
+@@ -2079,9 +2171,59 @@
+     return rvA1->GetValue();
+ }
+ 
++bool regimeHigh = false;
++double regimeNextS = 1e18;
++Ptr<ExponentialRandomVariable> rvUpd;
++
++void SmoPublish(double gv, double hv);
++
++void
++RegimeSwitch()
++{
++    regimeHigh = !regimeHigh;
++    surgeActive = regimeHigh ? g.surgeSessions : 0;
++    const bool split = g.surgeDwellS > 0 || g.surgeUnlinked;
++    double raw = rvA1->GetValue();
++    if (g.surgeDwellS > 0 || g.surgeDuty != 0.5)
++    {
++        const double base = g.surgeDwellS > 0 ? g.surgeDwellS : g.a1MeanS;
++        raw = raw / g.a1MeanS * base * 2.0 * (regimeHigh ? g.surgeDuty : 1.0 - g.surgeDuty);
++    }
++    const double dwell = std::max(g.surgeLeadS + 0.1, raw);
++    regimeNextS = Simulator::Now().GetSeconds() + dwell;
++    if (!split)
++    {
++        // the rApp issues the next regime's intent ahead of it
++        Simulator::Schedule(Seconds(dwell - g.surgeLeadS), []() {
++            SmoPublish(regimeHigh ? g.surgeLowG : g.surgeHighG, g.surgeH);
++        });
++    }
++    Simulator::Schedule(Seconds(dwell), &RegimeSwitch);
++}
++
++// Update spacing apart from the dwell: the rApp publishes at Poisson times the regime it
++// knows surgeLeadS ahead, or a draw independent of the regime for the unlinked control.
++void
++SurgePublishLoop()
++{
++    Simulator::Schedule(Seconds(rvUpd->GetValue()), &SurgePublishLoop);
++    if (g.surgeUnlinked)
++    {
++        SmoPublish(rvIntent->GetValue() < 0.5 ? g.surgeHighG : g.surgeLowG, g.surgeH);
++        return;
++    }
++    const bool flipped = Simulator::Now().GetSeconds() + g.surgeLeadS >= regimeNextS;
++    const bool high = flipped ? !regimeHigh : regimeHigh;
++    SmoPublish(high ? g.surgeHighG : g.surgeLowG, g.surgeH);
++}
++
+ void
+ SmoIssue()
+ {
++    if (g.surge)
++    {
++        return;
++    }
+     Simulator::Schedule(Seconds(NextA1Gap()), &SmoIssue);
+     static const double gs[4] = {0.2, 0.3, 0.4, 0.5};
+     static const double hs[3] = {0.1, 0.2, 0.3};
+@@ -2089,8 +2231,28 @@
+     p.ver = smoCur.ver + 1;
+     // Intent values come from their own stream so that every strategy sees
+     // the same sequence of intents for the same run (paired comparison).
+-    p.g = gs[rvIntent->GetInteger(0, 3)];
+-    p.h = hs[rvIntent->GetInteger(0, 2)];
++    if (g.a1Step)
++    {
++        static int ig = 1;
++        static int ih = 1;
++        const bool moveG = rvIntent->GetValue() < 0.5;
++        const int step = rvIntent->GetValue() < 0.5 ? 1 : -1;
++        if (moveG)
++        {
++            ig = (ig + step < 0 || ig + step > 3) ? ig - step : ig + step;
++        }
++        else
++        {
++            ih = (ih + step < 0 || ih + step > 2) ? ih - step : ih + step;
++        }
++        p.g = gs[ig];
++        p.h = hs[ih];
++    }
++    else
++    {
++        p.g = gs[rvIntent->GetInteger(0, 3)];
++        p.h = hs[rvIntent->GetInteger(0, 2)];
++    }
+     smoCur = p;
+     verIssued[p.ver] = Simulator::Now().GetSeconds();
+     smoMgr->UpdatePolicy(smoPolicyId, ToA1(p));
+@@ -2108,6 +2270,54 @@
+     }
+ }
+ 
++// Provisioning through any gateway: every satellite with its feeder up that has not acknowledged the
++// current version gets it, with the same lease stamp as the serving satellite.
++void
++ProvisionAll()
++{
++    if (!g.provisionAll || !IsOnboardLike())
++    {
++        return;
++    }
++    for (int s = 0; s < static_cast<int>(sats.size()); ++s)
++    {
++        if (s == servingIdx || !sats[s].linkUp || satAckedVer[s] >= smoCur.ver)
++        {
++            continue;
++        }
++        MgmtHeader a;
++        a.type = A1_PUT;
++        a.ver = smoCur.ver;
++        a.v1 = smoCur.g;
++        a.v2 = smoCur.h;
++        a.untilNs = OnbLeaseUntilNs();
++        SendToSat(s, a, PayloadSize(A1_PUT, 0), true);
++    }
++}
++
++void
++SmoPublish(double gv, double hv)
++{
++    Policy p;
++    p.ver = smoCur.ver + 1;
++    p.g = gv;
++    p.h = hv;
++    smoCur = p;
++    verIssued[p.ver] = Simulator::Now().GetSeconds();
++    smoMgr->UpdatePolicy(smoPolicyId, ToA1(p));
++    if (IsOnboardLike() && servingIdx >= 0 && gview[servingIdx].e2)
++    {
++        MgmtHeader a;
++        a.type = A1_PUT;
++        a.ver = p.ver;
++        a.v1 = p.g;
++        a.v2 = p.h;
++        a.untilNs = OnbLeaseUntilNs();
++        SendToSat(servingIdx, a, PayloadSize(A1_PUT, 0), true);
++    }
++    ProvisionAll();
++}
++
+ // SMO -> ground RIC over the cloud link (10 ms), modeled through the A1
+ // manager's delivery delay; the RIC then mirrors to satellites per strategy.
+ void
+@@ -2143,6 +2353,7 @@
+ SmoRetryLoop()
+ {
+     Simulator::Schedule(Seconds(g.a1RetryS), &SmoRetryLoop);
++    ProvisionAll();
+     if (!IsOnboardLike() || servingIdx < 0)
+     {
+         return;
+@@ -2306,6 +2517,10 @@
+         uint16_t grant = 0;
+         for (int c = kNF; c < kClasses; ++c)
+         {
++            if (g.nfPinOnboard && c == kNF)
++            {
++                continue;
++            }
+             const Time loop = PredictedGroundLoop(s) + Seconds(g.procGroundS[c]);
+             const auto host = L::Place(loop, Seconds(g.deadlineS[c]), g.slack, remain,
+                                        Seconds(g.leadS));
+@@ -2613,6 +2828,7 @@
+     {
+         const int prev = servingIdx;
+         ++serveSeg;
++        BeamAccrue();
+         servingIdx = serveTl[serveSeg].sat;
+         if (inOutage)
+         {
+@@ -2825,6 +3041,138 @@
+     st.overSum += std::max(0.0, a - r);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Data plane (round 3): one cell of capacity C shared by the critical slice and a
++// saturated best-effort slice. Real packets, a 1 ms scheduler with a hard partition
++// x C / (1 - x) C, sinks over point-to-point devices.
++// ---------------------------------------------------------------------------
++struct DpStat
++{
++    uint64_t critOffered{0}, critDelivered{0}, critDropped{0}, beDelivered{0};
++    double servedS{0};
++    std::array<uint64_t, 1001> latHist{};
++    double surgeOffered{0}, surgeDelivered{0};
++} dp;
++struct CritPkt
++{
++    Ptr<Packet> p;
++    Time born;
++    bool surge;
++};
++std::deque<CritPkt> critQ;
++std::deque<std::pair<Time, bool>> critInFlight;
++Ptr<NetDevice> dpCritTx, dpBeTx;
++double dpBudgetCrit = 0, dpBudgetBe = 0;
++Ptr<ExponentialRandomVariable> rvPkt;
++Ptr<UniformRandomVariable> rvPktU;
++
++bool
++DpCritRx(Ptr<NetDevice>, Ptr<const Packet> p, uint16_t, const Address&)
++{
++    const auto e = critInFlight.front();
++    critInFlight.pop_front();
++    dp.critDelivered += p->GetSize();
++    if (e.second)
++    {
++        dp.surgeDelivered += p->GetSize();
++    }
++    const double ms = (Simulator::Now() - e.first).GetMilliSeconds();
++    ++dp.latHist[std::min<size_t>(1000, static_cast<size_t>(ms))];
++    return true;
++}
++
++bool
++DpBeRx(Ptr<NetDevice>, Ptr<const Packet> p, uint16_t, const Address&)
++{
++    dp.beDelivered += p->GetSize();
++    return true;
++}
++
++// Offered critical traffic: Poisson packets at the rate of the active sessions. The
++// generator draws at the peak rate and thins, so no event depends on the strategy.
++void
++DpArrival()
++{
++    const double peak = 1.0 * g.cellMbps * 1e6 / (8.0 * g.pktBytes);
++    Simulator::Schedule(Seconds(rvPkt->GetValue() / peak), &DpArrival);
++    const double rate = g.sessionShare * (sessions + surgeActive);
++    if (servingIdx < 0 || rvPktU->GetValue() >= rate)
++    {
++        return;
++    }
++    dp.critOffered += g.pktBytes;
++    const bool sg = surgeActive > 0;
++    if (sg)
++    {
++        dp.surgeOffered += g.pktBytes;
++    }
++    critQ.push_back({Create<Packet>(g.pktBytes), Simulator::Now(), sg});
++}
++
++void
++DpTti()
++{
++    Simulator::Schedule(MilliSeconds(1), &DpTti);
++    if (servingIdx < 0)
++    {
++        return;
++    }
++    dp.servedS += 0.001;
++    const Sat& sat = sats[servingIdx];
++    const double x = sat.share < 0 ? g.defaultShare : sat.share;
++    const double perTti = g.cellMbps * 1e6 / 8.0 * 0.001;
++    const double L = g.pktBytes;
++    dpBudgetCrit = std::min(dpBudgetCrit, L) + x * perTti;
++    dpBudgetBe = std::min(dpBudgetBe, L) + (1.0 - x) * perTti;
++    const Time now = Simulator::Now();
++    while (!critQ.empty() && now - critQ.front().born > Seconds(g.critDeadlineS))
++    {
++        dp.critDropped += g.pktBytes;
++        critQ.pop_front();
++    }
++    while (!critQ.empty() && dpBudgetCrit >= L)
++    {
++        dpBudgetCrit -= L;
++        critInFlight.push_back({critQ.front().born, critQ.front().surge});
++        dpCritTx->Send(critQ.front().p, dpCritTx->GetBroadcast(), 0x0800);
++        critQ.pop_front();
++    }
++    if (g.workConserving && critQ.empty() && dpBudgetCrit >= L)
++    {
++        dpBudgetBe += dpBudgetCrit;
++        dpBudgetCrit = 0;
++    }
++    while (dpBudgetBe >= L)
++    {
++        dpBudgetBe -= L;
++        dpBeTx->Send(Create<Packet>(g.pktBytes), dpBeTx->GetBroadcast(), 0x0800);
++    }
++}
++
++void
++DpSetup()
++{
++    PointToPointHelper h;
++    h.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
++    h.SetChannelAttribute("Delay", StringValue("1ms"));
++    h.SetQueue("ns3::DropTailQueue<Packet>", "MaxSize", StringValue("100000p"));
++    NodeContainer n;
++    n.Create(4);
++    NetDeviceContainer c = h.Install(n.Get(0), n.Get(1));
++    NetDeviceContainer b = h.Install(n.Get(2), n.Get(3));
++    dpCritTx = c.Get(0);
++    dpBeTx = b.Get(0);
++    c.Get(1)->SetReceiveCallback(MakeCallback(&DpCritRx));
++    b.Get(1)->SetReceiveCallback(MakeCallback(&DpBeRx));
++    rvPkt = CreateObject<ExponentialRandomVariable>();
++    rvPkt->SetAttribute("Mean", DoubleValue(1.0));
++    rvPkt->SetStream(30);
++    rvPktU = CreateObject<UniformRandomVariable>();
++    rvPktU->SetStream(31);
++    Simulator::Schedule(MilliSeconds(1), &DpTti);
++    Simulator::Schedule(MilliSeconds(1), &DpArrival);
++}
++
+ // Demand: M/M/inf sessions on the critical slice.
+ void
+ Arrival()
+@@ -2912,6 +3260,33 @@
+     cmd.AddValue("nfAccGround", "decision accuracy of the ground (full) NF xApp", g.nfAccGround);
+     cmd.AddValue("safeG", "guaranteed share of the safe intent", g.safeG);
+     cmd.AddValue("safeH", "headroom of the safe intent", g.safeH);
++    cmd.AddValue("fixedLeaseS", "fixed lease timer (s); <0 uses the closed-form rule", g.fixedLeaseS);
++    cmd.AddValue("slack", "deadline slack kappa of the placement test", g.slack);
++    cmd.AddValue("cellLat", "cell latitude (deg)", g.cellLat);
++    cmd.AddValue("cellLon", "cell longitude (deg)", g.cellLon);
++    cmd.AddValue("gwList", "gateways lat:lon,lat:lon,... (RIC at the first)", g.gwList);
++    cmd.AddValue("nfPinOnboard", "PAL host test: keep the NF class on board", g.nfPinOnboard);
++    cmd.AddValue("beamCv2", "squared CV of the best-beam dwell", g.beamCv2);
++    cmd.AddValue("beamDrift", "probability a beam jump repeats the last direction", g.beamDrift);
++    cmd.AddValue("errRho", "correlation of consecutive NF decision outcomes", g.errRho);
++    cmd.AddValue("a1Step", "intents move one step in the alphabet instead of a redraw", g.a1Step);
++    cmd.AddValue("oracleIntent", "control arm: on-board decisions always use the current intent", g.oracleIntent);
++    cmd.AddValue("surge", "intents linked to demand through a two-state regime", g.surge);
++    cmd.AddValue("surgeSessions", "sessions added during a surge", g.surgeSessions);
++    cmd.AddValue("surgeHighG", "guaranteed share of the surge intent", g.surgeHighG);
++    cmd.AddValue("surgeLowG", "guaranteed share of the quiet intent", g.surgeLowG);
++    cmd.AddValue("surgeH", "headroom of both intents", g.surgeH);
++    cmd.AddValue("dataPlane", "packet data plane with a best-effort slice", g.dataPlane);
++    cmd.AddValue("cellMbps", "cell capacity (Mb/s)", g.cellMbps);
++    cmd.AddValue("initG", "guaranteed share of the first intent, held from launch", g.initG);
++    cmd.AddValue("provisionAll", "push A1 versions to every satellite whose feeder is up (on-board strategies)", g.provisionAll);
++    cmd.AddValue("initH", "headroom of the first intent, held from launch", g.initH);
++    cmd.AddValue("surgeLeadS", "rApp knowledge of the regime ahead (s)", g.surgeLeadS);
++    cmd.AddValue("surgeDwellS", "regime dwell apart from a1MeanS (s)", g.surgeDwellS);
++    cmd.AddValue("surgeDuty", "share of time in a surge", g.surgeDuty);
++    cmd.AddValue("surgeUnlinked", "surges with intents independent of them", g.surgeUnlinked);
++    cmd.AddValue("nsPeriodS", "period and deadline of the slicing class (s)", g.periodS[kNS]);
++    cmd.AddValue("workConserving", "BE may use critical budget left idle in a TTI", g.workConserving);
+     cmd.AddValue("outputDir", "output directory", g.outDir);
+     cmd.AddValue("run", "RNG run (seed index)", g.run);
+     cmd.Parse(argc, argv);
+@@ -2943,6 +3318,24 @@
+     else
+         NS_ABORT_MSG("unknown strategy " << strat);
+     NS_ABORT_MSG_IF(g.numGw < 1 || g.numGw > 4, "numGw must be 1..4");
++    g.deadlineS[kNS] = g.periodS[kNS];
++    if (!g.gwList.empty())
++    {
++        std::stringstream ss(g.gwList);
++        std::string item;
++        int n = 0;
++        while (std::getline(ss, item, ',') && n < 4)
++        {
++            const auto c = item.find(':');
++            kGw[n].name = "custom";
++            kGw[n].lat = std::stod(item.substr(0, c));
++            kGw[n].lon = std::stod(item.substr(c + 1));
++            ++n;
++        }
++        NS_ABORT_MSG_IF(n < static_cast<int>(g.numGw), "gwList shorter than numGw");
++        kRicLat = kGw[0].lat;
++        kRicLon = kGw[0].lon;
++    }
+ 
+     RngSeedManager::SetSeed(20261016);
+     RngSeedManager::SetRun(g.run);
+@@ -3260,7 +3653,7 @@
+     smoMgr->SetDeliveryDelay(MilliSeconds(10)); // SMO-RIC cloud link
+     ricA1 = CreateObject<OranNtnA1Adapter>();
+     smoMgr->SetDistributionCallback(MakeCallback(&RicOnA1));
+-    smoCur = Policy{1, 0.3, 0.2, Seconds(0)};
++    smoCur = Policy{1, g.initG, g.initH, Seconds(0)};
+     verIssued[1] = 0.0;
+     smoPolicyId = smoMgr->CreatePolicy(ToA1(smoCur));
+     ricA1->HandleIncomingPolicy(ToA1(smoCur)); // initial provisioning
+@@ -3304,6 +3697,28 @@
+         Simulator::Schedule(Seconds(1.0 + rvU->GetValue(0, g.periodS[c])), &Epoch, c);
+     }
+     Simulator::Schedule(MilliSeconds(50), &SlaTick);
++    if (g.dataPlane)
++    {
++        DpSetup();
++    }
++    if (g.surge)
++    {
++        double first = rvA1->GetValue();
++        if (g.surgeDwellS > 0)
++        {
++            first = first / g.a1MeanS * g.surgeDwellS;
++        }
++        first = std::max(g.surgeLeadS + 0.1, first);
++        regimeNextS = first;
++        Simulator::Schedule(Seconds(first), &RegimeSwitch);
++        if (g.surgeDwellS > 0 || g.surgeUnlinked)
++        {
++            rvUpd = CreateObject<ExponentialRandomVariable>();
++            rvUpd->SetAttribute("Mean", DoubleValue(g.a1MeanS));
++            rvUpd->SetStream(33);
++            Simulator::Schedule(Seconds(rvUpd->GetValue()), &SurgePublishLoop);
++        }
++    }
+     Simulator::Schedule(Seconds(1.0), &SubRetryLoop);
+     Simulator::Schedule(Seconds(rvArr->GetValue()), &Arrival);
+     // Warm the session process to stationarity: start with Poisson(lambda*T)
+@@ -3345,7 +3760,12 @@
+     {
+         Simulator::Schedule(Seconds(0.45), &SmoLeaseRefreshLoop);
+     }
+-    Simulator::Schedule(MilliSeconds(5), &BeamTick);
++    for (int i = 0; i < kNT; ++i)
++    {
++        beamDir[i] = rvBeam->GetValue() < 0.5 ? 1 : -1;
++        Simulator::Schedule(Seconds(BeamGap(i)), &BeamJump, i);
++    }
++    Simulator::Schedule(Seconds(1), &BeamCleanup);
+     if (UsesHeartbeat())
+     {
+         Simulator::Schedule(Seconds(0.5), &HbLoop);
+@@ -3361,6 +3781,7 @@
+ 
+     Simulator::Stop(Seconds(g.simS));
+     Simulator::Run();
++    BeamAccrue();
+ 
+     // Close an outage still open at the end.
+     if (inOutage)
+@@ -3389,7 +3810,7 @@
+              "sig_msgs_per_switch,preprov_frac,feeder_bytes,feeder_kbps,autonomy_entries,"
+              "false_autonomy,leases,kpm_delivered,kpm_discarded,ctrl_lost,kpm_codec_fail,fallback_frac,"
+              "hb_kbps,lease_kbps,e2setup_kbps,kpm_kbps,ctrl_kbps,a1_kbps,recon_kbps,lease_tau_s,merge_ground_applied,"
+-             "nf_onb_decisions,ns_onb_decisions,arq_retx,arq_dup,arq_kbps,soft_switches,beam_samples";
++             "nf_onb_decisions,ns_onb_decisions,arq_retx,arq_dup,arq_kbps,soft_switches,beam_served_s";
+         for (int i = 0; i < kNT; ++i)
+         {
+             for (int j = 0; j < kNG; ++j)
+@@ -3471,18 +3892,45 @@
+           << kbps({RC_CTRL}) << "," << kbps({A1_PUT, A1_ACK}) << "," << kbps({RECON, RECON_ACK})
+           << "," << LeaseTau().GetSeconds() << "," << st.mergeGroundApplied << ","
+           << st.nfOnbDecisions << "," << st.nsOnbDecisions << "," << st.arqRetx << "," << st.arqDup
+-          << "," << kbps({ARQ_ACK}) << "," << softSwitches << "," << beamSamp;
++          << "," << kbps({ARQ_ACK}) << "," << softSwitches << "," << beamServedS;
+         for (int i = 0; i < kNT; ++i)
+         {
+             for (int j = 0; j < kNG; ++j)
+             {
+-                f << "," << (beamSamp ? double(beamMis[i][j]) / beamSamp : 0.0);
++                f << "," << (beamServedS > 0 ? beamMisS[i][j] / beamServedS : 0.0);
+             }
+         }
+         f << "," << (st.slaSamples ? st.shortSum / st.slaSamples : 0) << ","
+           << (st.slaViol ? st.shortSumViol / st.slaViol : 0) << "," << st.satPredEntries;
+         f << "\n";
+     }
++    if (g.dataPlane)
++    {
++        std::ofstream f(g.outDir + "/dataplane.csv");
++        uint64_t n = 0, c = 0;
++        for (auto v : dp.latHist)
++        {
++            n += v;
++        }
++        double p99 = 0;
++        for (size_t i = 0; i < dp.latHist.size(); ++i)
++        {
++            c += dp.latHist[i];
++            if (n && c >= 0.99 * n)
++            {
++                p99 = i;
++                break;
++            }
++        }
++        const double cap = g.cellMbps * 1e6 / 8.0 * dp.servedS;
++        f << "crit_offered,crit_delivered,crit_dropped,crit_queued,crit_inflight,be_delivered,served_s,cap_bytes,"
++             "crit_ratio,be_share,total_share,crit_p99_ms,surge_offered,surge_delivered\n";
++        f << dp.critOffered << "," << dp.critDelivered << "," << dp.critDropped << "," << critQ.size() * g.pktBytes << ","
++          << critInFlight.size() * g.pktBytes << "," << dp.beDelivered << "," << dp.servedS << "," << cap << ","
++          << (dp.critOffered ? double(dp.critDelivered) / dp.critOffered : 0.0) << "," << dp.beDelivered / cap << ","
++          << (dp.beDelivered + dp.critDelivered) / cap << "," << p99 << "," << dp.surgeOffered << ","
++          << dp.surgeDelivered << "\n";
++    }
+     {
+         std::ofstream f(g.outDir + "/outages.csv");
+         f << "start,end,dur,predicted,ended_by_switch,direct_conflicts,policy_stale,ttc,kind,fallback\n";
