@@ -245,6 +245,16 @@ OranNtnNearRtRic::Initialize()
 
     // A1 feedback wiring is done externally via ConnectA1Interface in the helper
 
+    // O-RAN.WG3.RICARCH: the Near-RT RIC control loop runs between 10 ms and
+    // 1 s. Below 10 ms is the RT tier (OranNtnRtRic), above 1 s is Non-RT RIC
+    // territory. The attribute accepted any value, so a mis-set interval
+    // silently turned this object into a different tier.
+    NS_ABORT_MSG_IF(m_controlLoopInterval < MilliSeconds(10) ||
+                        m_controlLoopInterval > Seconds(1),
+                    "Near-RT RIC ControlLoopInterval " << m_controlLoopInterval.As(Time::MS)
+                                                       << " is outside the O-RAN WG3 "
+                                                          "near-real-time range [10 ms, 1 s]");
+
     // Start the RIC control loop
     m_controlLoopEvent = Simulator::Schedule(m_controlLoopInterval,
                                               &OranNtnNearRtRic::ControlLoop,
@@ -532,7 +542,10 @@ OranNtnNearRtRic::WriteMetrics(const std::string& filename) const
         ofs << "xApp " << xapp->GetXappName() << " (id=" << id
             << ", priority=" << (int)xapp->GetPriority() << "):\n"
             << "  Decisions: " << xm.totalDecisions << "\n"
-            << "  Successful Actions: " << xm.successfulActions << "\n"
+            // Wave 2 M2 (P0-1): "Successful Actions" meant ROUTED by the RIC and
+            // was read as actuated. Both are printed now, under their own names.
+            << "  Routed Actions: " << xm.successfulActions << "\n"
+            << "  Actuated Actions: " << xm.actuatedActions << "\n"
             << "  Failed Actions: " << xm.failedActions << "\n"
             << "  Conflicts: " << xm.conflictsEncountered
             << " (won " << xm.conflictsWon << ")\n"
@@ -580,6 +593,14 @@ OranNtnNearRtRic::RouteIndicationToXapps(uint32_t subscriptionId,
     // Store in SDL
     m_sdl->StoreLatestKpm(report.gnbId, report);
     m_kpmReceived(report.gnbId, report);
+
+    // A report without a radio measurement stays in the SDL (with its flag) but is not routed:
+    // every xApp decision reads its radio fields, which carry no information yet.
+    if (!report.radioValid)
+    {
+        ++m_noRadioReports;
+        return;
+    }
 
     // Route to subscribed xApps
     for (auto& [id, xapp] : m_xapps)

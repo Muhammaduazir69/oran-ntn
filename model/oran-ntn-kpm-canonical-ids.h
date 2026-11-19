@@ -49,6 +49,14 @@ inline constexpr const char* kRruPrbAvailDl   = "RRU.PrbAvailDl";
 inline constexpr const char* kRruPrbAvailUl   = "RRU.PrbAvailUl";
 inline constexpr const char* kRruPrbUsedDl    = "RRU.PrbUsedDl";
 inline constexpr const char* kRruPrbUsedUl    = "RRU.PrbUsedUl";
+// Wave 6B, checked against 3GPP TS 28.552 V20.4.0 (2026-09): the PERCENTAGE
+// of PRBs used ("DL Total PRB Usage", clause 5.1.1.2.1, integer 0..100) is
+// RRU.PrbDl. RRU.PrbUsedDl (5.1.1.2.5) is the MEAN NUMBER of PRBs used for
+// data and RRU.PrbAvailDl (5.1.1.2.6) the mean number available; both are
+// counts, not ratios. The older "RRU.PrbTotDl" name survives only in the
+// distribution counter RRU.PrbTotDlDist (5.1.1.2.3). Until Wave 6B the
+// percentage travelled only as the vendor field VND.PrbUtilDl (0..1).
+inline constexpr const char* kRruPrbDl        = "RRU.PrbDl";
 // TB.ErrTotNbrDl / TB.TotNbrDl — canonical 3GPP TS 28.552 DL transport-block
 // counters. The DL TB error rate is the ratio ErrTotNbrDl / TotNbrDl; it is
 // already measured upstream as the HARQ BLER (see BuildCanonicalKpmMeasurements).
@@ -95,6 +103,9 @@ namespace provenance
 inline constexpr const char* kMeasured    = "measured";
 inline constexpr const char* kDerived     = "derived";
 inline constexpr const char* kSynthesized = "synthesized";
+/// A cell-configuration quantity (e.g. RRU.PrbAvailDl from the BWP): neither
+/// measured nor estimated.
+inline constexpr const char* kConfigured  = "configured";
 } // namespace provenance
 
 /// A single canonical KPM measurement. `value` is in WG3-canonical units
@@ -124,7 +135,7 @@ BuildCanonicalKpmMeasurements(const E2KpmReport& report,
 /// The `provenance` column (measured|derived|synthesized) lets a consumer
 /// reject non-ground-truth values without guessing.
 ///
-/// Each report produces 12 rows (one per canonical metric ID). Rows with
+/// Each report produces 13 rows (one per canonical metric ID). Rows with
 /// not-yet-plumbed source fields carry `present = 0`.
 /// `baseLabels` must contain entries for kFiveQi, kSnssai, kPlmn.
 void

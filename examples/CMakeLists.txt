@@ -77,6 +77,7 @@ build_lib_example(
   NAME ntn-e2e-full-stack
   SOURCE_FILES ntn-e2e-full-stack.cc
   LIBRARIES_TO_LINK
+    ${libntn-observability}
     ${liboran-ntn}
     ${libntn-slice}
     ${libntn-traffic}
@@ -159,6 +160,10 @@ build_lib_example(
   LIBRARIES_TO_LINK
     ${liboran-ntn}
     ${libntn-traffic}
+    ${libntn-constellation}
+    ${libntn-cho}
+    ${libntn-observability}
+    ${libmobility}
     ${libcore}
     ${libnetwork}
     ${libinternet}
@@ -192,6 +197,9 @@ build_lib_example(
   SOURCE_FILES oran-ntn-e2-termination.cc
   LIBRARIES_TO_LINK
     ${liboran-ntn}
+    ${libntn-traffic}
+    ${libntn-constellation}
+    ${libntn-cho}
     ${libcore}
     ${libnetwork}
 )
@@ -204,6 +212,12 @@ build_lib_example(
   LIBRARIES_TO_LINK
     ${liboran-ntn}
     ${libntn-constellation}
+    ${libntn-cho}
+    ${libntn-traffic}
+    ${libntn-observability}
+    ${libflow-monitor}
+    ${libapplications}
+    ${libmobility}
     ${libcore}
     ${libnetwork}
     ${libmobility}

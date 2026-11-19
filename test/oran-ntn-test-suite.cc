@@ -58,6 +58,12 @@
 #include "ns3/oran-ntn-xapp-energy-harvest.h"
 #include "ns3/oran-ntn-xapp-ho-predict.h"
 #include "ns3/oran-ntn-helper.h"
+#include "ns3/oran-ntn-e2-transport.h"
+#include "ns3/oran-ntn-e2-path.h"
+#include "ns3/constant-velocity-mobility-model.h"
+#include "ns3/constant-position-mobility-model.h"
+#include "ns3/data-rate.h"
+#include "ns3/uinteger.h"
 #include "ns3/ntn-static-extra-loss-model.h"
 #include "ns3/oran-ntn-loop-latency-probe.h"
 #include "ns3/oran-ntn-twin-prediction-consumer.h"
@@ -133,6 +139,57 @@ class OranNtnRicTestCase : public TestCase
         NS_TEST_ASSERT_MSG_EQ(ids.size(), 0u, "Should have 0 xApps after deregister");
 
         ric->Dispose();
+        Simulator::Destroy();
+    }
+};
+
+// ============================================================================
+//  Wave 4: a KPM report without a radio measurement (radioValid = false)
+// ============================================================================
+
+/**
+ * Before the first PHY measurement a producer used to send a -100 dB sentinel SINR, which reached
+ * xApps (and SINR event triggers) as a real value. The report now says "no radio measurement":
+ * the flag survives the E2 packet transport, and the xApp base never stores or processes it.
+ */
+class OranNtnNoRadioMeasurementTestCase : public TestCase
+{
+  public:
+    OranNtnNoRadioMeasurementTestCase()
+        : TestCase("O-RAN NTN KPM without a radio measurement is carried but not acted on")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        E2KpmReport none{};
+        none.gnbId = 7;
+        none.ueId = 1;
+        none.timestamp = 1.0;
+        none.radioValid = false;
+        none.sinr_dB = std::nan("");
+        E2KpmReport back{};
+        NS_TEST_ASSERT_MSG_EQ(OranNtnE2Transport::DecodeKpm(OranNtnE2Transport::EncodeKpm(none), back),
+                              true, "decode");
+        NS_TEST_ASSERT_MSG_EQ(back.radioValid, false, "radioValid=false must survive the transport");
+
+        E2KpmReport meas = none;
+        meas.radioValid = true;
+        meas.sinr_dB = 12.5;
+        meas.timestamp = 2.0;
+        NS_TEST_ASSERT_MSG_EQ(OranNtnE2Transport::DecodeKpm(OranNtnE2Transport::EncodeKpm(meas), back),
+                              true, "decode");
+        NS_TEST_ASSERT_MSG_EQ(back.radioValid, true, "a measured report stays valid");
+
+        auto xapp = CreateObject<OranNtnXappHoPredict>();
+        xapp->HandleKpmIndication(1, none);
+        NS_TEST_ASSERT_MSG_EQ(xapp->GetLatestReport(7).timestamp, 0.0,
+                              "an xApp must not store a report without a radio measurement");
+        xapp->HandleKpmIndication(1, meas);
+        NS_TEST_ASSERT_MSG_EQ_TOL(xapp->GetLatestReport(7).sinr_dB, 12.5, 1e-9,
+                                  "a measured report is stored");
+        xapp->Dispose();
         Simulator::Destroy();
     }
 };
@@ -1660,8 +1717,8 @@ class OranNtnKpmCanonicalIdsListTestCase : public TestCase
     {
         const auto& ids = oranntn::kpm::CanonicalMetricIds();
         NS_TEST_ASSERT_MSG_EQ(ids.size(),
-                              12u,
-                              "canonical KPM set must have 12 entries");
+                              13u,
+                              "canonical KPM set must have 13 entries");
         NS_TEST_EXPECT_MSG_EQ(ids[0], "DRB.UEThpDl", "ids[0]");
         NS_TEST_EXPECT_MSG_EQ(ids[1], "DRB.UEThpUl", "ids[1]");
         NS_TEST_EXPECT_MSG_EQ(ids[2], "DRB.PdcpSduVolumeDL", "ids[2]");
@@ -1674,6 +1731,8 @@ class OranNtnKpmCanonicalIdsListTestCase : public TestCase
         NS_TEST_EXPECT_MSG_EQ(ids[9], "L1M.RS-SINR.Mean", "ids[9]");
         NS_TEST_EXPECT_MSG_EQ(ids[10], "TB.TotNbrDl", "ids[10]");
         NS_TEST_EXPECT_MSG_EQ(ids[11], "TB.ErrTotNbrDl", "ids[11]");
+        // TS 28.552 V20.4.0 5.1.1.2.1: the percentage counter is RRU.PrbDl.
+        NS_TEST_EXPECT_MSG_EQ(ids[12], "RRU.PrbDl", "ids[12]");
 
         NS_TEST_EXPECT_MSG_EQ(std::string(oranntn::label::kFiveQi),
                               "FIVE_QI",
@@ -1691,7 +1750,7 @@ class OranNtnKpmCanonicalBuildTestCase : public TestCase
 {
   public:
     OranNtnKpmCanonicalBuildTestCase()
-        : TestCase("BuildCanonicalKpmMeasurements emits all 12 IDs with correct values")
+        : TestCase("BuildCanonicalKpmMeasurements emits all 13 IDs with correct values")
     {
     }
 
@@ -1703,6 +1762,7 @@ class OranNtnKpmCanonicalBuildTestCase : public TestCase
         r.sinr_dB = 12.5;
         r.throughput_Mbps = 50.0; // 50 000 kbps
         r.prbUtilization = 0.5;   // 50% of 273 PRBs => 136.5
+        r.prbAvailDl = 273.0;     // the cell's configured PRBs (100 MHz, 30 kHz)
         r.harqBler = 0.02;        // measured DL HARQ BLER fraction
 
         const std::map<std::string, std::string> base = {
@@ -1711,7 +1771,7 @@ class OranNtnKpmCanonicalBuildTestCase : public TestCase
             {oranntn::label::kPlmn, "00101"},
         };
         const auto v = oranntn::BuildCanonicalKpmMeasurements(r, base);
-        NS_TEST_ASSERT_MSG_EQ(v.size(), 12u, "vector size");
+        NS_TEST_ASSERT_MSG_EQ(v.size(), 13u, "vector size (12 + RRU.PrbDl, Wave 6B)");
 
         // Build a name->index map so the test is robust to ordering.
         std::map<std::string, size_t> idx;
@@ -1737,6 +1797,47 @@ class OranNtnKpmCanonicalBuildTestCase : public TestCase
         NS_TEST_EXPECT_MSG_EQ(v[idx[oranntn::kpm::kRruPrbUsedDl]].value,
                               136.5,
                               "RRU.PrbUsedDl = util * PRBs");
+
+        // Wave 2 M2: without a cell configuration the PRB counters are not
+        // invented (they used to be 273 PRBs for every cell).
+        {
+            E2KpmReport u{};
+            u.prbUtilization = 0.5;
+            const auto w = oranntn::BuildCanonicalKpmMeasurements(u, base);
+            std::map<std::string, size_t> wi;
+            for (size_t i = 0; i < w.size(); ++i)
+            {
+                wi[w[i].metricId] = i;
+            }
+            NS_TEST_EXPECT_MSG_EQ(w[wi[oranntn::kpm::kRruPrbAvailDl]].labels.at(
+                                      oranntn::label::kPresent),
+                                  "false",
+                                  "unknown cell size => RRU.PrbAvailDl not present");
+            NS_TEST_EXPECT_MSG_EQ(w[wi[oranntn::kpm::kRruPrbUsedDl]].labels.at(
+                                      oranntn::label::kPresent),
+                                  "false",
+                                  "unknown cell size => RRU.PrbUsedDl not present");
+            // Measured counts are exported as integers with measured provenance.
+            u.prbAvailDl = 51.0;
+            u.prbUsedDl = 37.25;
+            u.tbTotDl = 954.0;
+            u.tbErrDl = 154.0;
+            const auto m = oranntn::BuildCanonicalKpmMeasurements(u, base);
+            std::map<std::string, size_t> mi;
+            for (size_t i = 0; i < m.size(); ++i)
+            {
+                mi[m[i].metricId] = i;
+            }
+            NS_TEST_EXPECT_MSG_EQ(m[mi[oranntn::kpm::kRruPrbAvailDl]].value, 51.0, "51 PRBs");
+            NS_TEST_EXPECT_MSG_EQ(m[mi[oranntn::kpm::kRruPrbUsedDl]].value, 37.25, "PRBs used");
+            NS_TEST_EXPECT_MSG_EQ(m[mi[oranntn::kpm::kRruPrbUsedDl]].provenance,
+                                  std::string(oranntn::provenance::kMeasured),
+                                  "PRBs used measured");
+            NS_TEST_EXPECT_MSG_EQ(m[mi[oranntn::kpm::kTbTotNbrDl]].value, 954.0, "TB count");
+            NS_TEST_EXPECT_MSG_EQ(m[mi[oranntn::kpm::kTbErrTotNbrDl]].value,
+                                  154.0,
+                                  "TB.ErrTotNbrDl is a count, not a fraction");
+        }
 
         // UL fields are not plumbed yet — must carry present=false sentinel.
         NS_TEST_EXPECT_MSG_EQ(
@@ -1803,7 +1904,7 @@ class OranNtnKpmCanonicalLabelsTestCase : public TestCase
             {oranntn::label::kPlmn, "00102"},
         };
         const auto v = oranntn::BuildCanonicalKpmMeasurements(r, base);
-        NS_TEST_ASSERT_MSG_EQ(v.size(), 12u, "vector size");
+        NS_TEST_ASSERT_MSG_EQ(v.size(), 13u, "vector size (12 + RRU.PrbDl)");
         for (const auto& m : v)
         {
             NS_TEST_EXPECT_MSG_EQ(m.labels.at(oranntn::label::kFiveQi),
@@ -2171,7 +2272,7 @@ class OranNtnKpmCanonicalCsvTestCase : public TestCase
 {
   public:
     OranNtnKpmCanonicalCsvTestCase()
-        : TestCase("Canonical kpm_canonical.csv is long-format with 12 rows per E2KpmReport")
+        : TestCase("Canonical kpm_canonical.csv is long-format with 13 rows per E2KpmReport")
     {
     }
 
@@ -2191,6 +2292,7 @@ class OranNtnKpmCanonicalCsvTestCase : public TestCase
         r.sinr_dB = sinr;
         r.throughput_Mbps = thpMbps;
         r.prbUtilization = prbUtil;
+        r.prbAvailDl = 273.0; // configured cell size (100 MHz / 30 kHz)
         return r;
     }
 
@@ -2225,6 +2327,7 @@ class OranNtnKpmCanonicalCsvTestCase : public TestCase
             oranntn::kpm::kRruPrbUsedDl,    oranntn::kpm::kRruPrbUsedUl,
             oranntn::kpm::kCarrAvgSinr,     oranntn::kpm::kL1mRsSinrMean,
             oranntn::kpm::kTbErrTotNbrDl,   oranntn::kpm::kTbTotNbrDl,
+            oranntn::kpm::kRruPrbDl,
         };
         size_t rowCount = 0;
         size_t notPresentCount = 0;
@@ -2258,7 +2361,7 @@ class OranNtnKpmCanonicalCsvTestCase : public TestCase
             seenIds.insert(metricId);
             // f[7] = provenance (measured|derived|synthesized)
             NS_TEST_EXPECT_MSG_EQ((f[7] == "measured" || f[7] == "derived" ||
-                                   f[7] == "synthesized"),
+                                   f[7] == "synthesized" || f[7] == "configured"),
                                   true,
                                   std::string("provenance '") + f[7] + "' is valid");
             // A not-present value must be tagged synthesized (no ground truth).
@@ -2275,11 +2378,11 @@ class OranNtnKpmCanonicalCsvTestCase : public TestCase
                 ++notPresentCount;
             }
         }
-        // 3 reports x 12 canonical metrics = 36 rows.
-        NS_TEST_EXPECT_MSG_EQ(rowCount, 36u, "row count");
+        // 3 reports x 13 canonical metrics = 39 rows.
+        NS_TEST_EXPECT_MSG_EQ(rowCount, 39u, "row count");
         NS_TEST_EXPECT_MSG_EQ(seenIds.size(),
-                              12u,
-                              "all 12 canonical IDs emitted at least once");
+                              13u,
+                              "all 13 canonical IDs emitted at least once");
         // Five IDs are not-present per report (3 UL-side: DRB.UEThpUl,
         // DRB.PdcpSduVolumeUL, RRU.PrbUsedUl; plus the two TB counters
         // TB.TotNbrDl / TB.ErrTotNbrDl which lack an integrating absolute-TB
@@ -7461,6 +7564,594 @@ class PrecoderReachesThePhasedArrayTest : public TestCase
     }
 };
 
+
+// ============================================================================
+//  Wave 2 M2: actuator admission, measured KPM over E2 packets, E2 transport
+// ============================================================================
+
+class OranNtnAdmissionRefusesUnactuatedXappsTest : public TestCase
+{
+  public:
+    OranNtnAdmissionRefusesUnactuatedXappsTest()
+        : TestCase("W2-M2: xApps whose actions have no actuator are refused at registration")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        auto helper = CreateObject<OranNtnHelper>();
+        auto ric = helper->CreateNearRtRic();
+        // Nothing registered: every catalogue xApp is refused.
+        auto none = helper->CreateAdmittedXapps(ric);
+        NS_TEST_ASSERT_MSG_EQ(none.size(), 0u, "no actuator, no xApp");
+        NS_TEST_ASSERT_MSG_EQ(helper->GetAdmissionLog().size(), 13u, "13 verdicts");
+        // A handover actuator admits exactly the xApps that only hand over.
+        auto ric2 = helper->CreateNearRtRic();
+        helper->RegisterActuator(E2RcActionType::HANDOVER_TRIGGER,
+                                 MakeCallback(+[](E2RcAction) { return true; }),
+                                 "test-ho");
+        auto ho = helper->CreateAdmittedXapps(ric2);
+        NS_TEST_ASSERT_MSG_EQ(ho.size(), 2u, "ho-predict and tn-ntn-steering");
+        NS_TEST_EXPECT_MSG_EQ(ho.count("ho-predict"), 1u, "ho-predict admitted");
+        NS_TEST_EXPECT_MSG_EQ(ho.count("tn-ntn-steering"), 1u, "tn-ntn-steering admitted");
+        for (const auto& a : helper->GetAdmissionLog())
+        {
+            if (a.xappName.rfind("thz", 0) == 0)
+            {
+                NS_TEST_EXPECT_MSG_EQ(a.admitted, false, "THz xApps refused on this radio");
+            }
+        }
+        // The dispatcher counts routed and actuated per type.
+        E2RcAction a;
+        a.actionType = E2RcActionType::HANDOVER_TRIGGER;
+        a.targetGnbId = 2;
+        NS_TEST_EXPECT_MSG_EQ(helper->ActuateRcAction(a), true, "registered actuator applies");
+        a.actionType = E2RcActionType::BEAM_HOP_SCHEDULE;
+        NS_TEST_EXPECT_MSG_EQ(helper->ActuateRcAction(a), false, "no actuator: not applied");
+        NS_TEST_EXPECT_MSG_EQ(helper->GetTotalRouted(), 2u, "two routed");
+        NS_TEST_EXPECT_MSG_EQ(helper->GetTotalActuated(), 1u, "one actuated");
+    }
+};
+
+class OranNtnE2KpmPayloadRoundTripTest : public TestCase
+{
+  public:
+    OranNtnE2KpmPayloadRoundTripTest()
+        : TestCase("W2-M2: measured report survives E2SM-KPM Format 1 encode/decode; "
+                   "unmeasured fields travel as noValue")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        E2KpmReport r{};
+        r.ueId = 7;
+        r.sliceId = 1;
+        r.isNtn = true;
+        r.sinr_dB = 18.25;
+        r.sinrMeasured = true;
+        r.rsrp_dBm = -101.0;
+        r.rsrpMeasured = true;
+        r.rsrq_dB = std::nan("");
+        r.throughput_Mbps = 4.5;
+        r.throughputMeasured = true;
+        r.rlcSduDelayDl_ms = 2.3;
+        r.latency_ms = 2.3;
+        r.latencyMeasured = true;
+        r.prbAvailDl = 51.0;
+        r.prbUsedDl = 40.5;
+        r.tbTotDl = 120.0;
+        r.tbErrDl = 3.0;
+        r.granularityPeriod_s = 0.1;
+        r.tte_s = std::nan("");
+        r.elevation_deg = 71.5;
+        const auto bytes = OranNtnE2Transport::EncodeKpm(r);
+        NS_TEST_ASSERT_MSG_GT(bytes.size(), 100u, "non-trivial payload");
+        E2KpmReport d;
+        NS_TEST_ASSERT_MSG_EQ(OranNtnE2Transport::DecodeKpm(bytes, d), true, "decodes");
+        NS_TEST_EXPECT_MSG_EQ(d.ueId, 7u, "ue id");
+        NS_TEST_EXPECT_MSG_EQ(+d.sliceId, 1, "slice id");
+        NS_TEST_EXPECT_MSG_EQ_TOL(d.sinr_dB, 18.25, 1e-12, "SINR");
+        NS_TEST_EXPECT_MSG_EQ_TOL(d.rsrp_dBm, -101.0, 1e-12, "RSRP");
+        NS_TEST_EXPECT_MSG_EQ(std::isnan(d.rsrq_dB), true, "unmeasured RSRQ stays unknown");
+        NS_TEST_EXPECT_MSG_EQ(std::isnan(d.tte_s), true, "unmeasured TTE stays unknown");
+        NS_TEST_EXPECT_MSG_EQ_TOL(d.throughput_Mbps, 4.5, 1e-9, "throughput");
+        NS_TEST_EXPECT_MSG_EQ_TOL(d.rlcSduDelayDl_ms, 2.3, 1e-9, "RLC SDU delay");
+        NS_TEST_EXPECT_MSG_EQ(d.prbAvailDl, 51.0, "PRBs available");
+        NS_TEST_EXPECT_MSG_EQ(d.tbErrDl, 3.0, "TB errors");
+        NS_TEST_EXPECT_MSG_EQ(d.sinrMeasured && d.rsrpMeasured && d.throughputMeasured &&
+                                  d.latencyMeasured && !d.rsrqMeasured && !d.prbMeasured,
+                              true,
+                              "provenance flags restored exactly");
+        E2RcAction a;
+        a.actionType = E2RcActionType::SLICE_PRB_ALLOCATION;
+        a.xappName = "slice-manager";
+        a.targetGnbId = 1;
+        a.targetSliceId = 1;
+        a.parameter1 = 0.3;
+        a.smControlMessage = {1, 2, 3};
+        E2RcAction b;
+        NS_TEST_ASSERT_MSG_EQ(OranNtnE2Transport::DecodeControl(
+                                  OranNtnE2Transport::EncodeControl(a), b),
+                              true,
+                              "control decodes");
+        NS_TEST_EXPECT_MSG_EQ(b.xappName, "slice-manager", "xApp name");
+        NS_TEST_EXPECT_MSG_EQ(+b.targetSliceId, 1, "slice");
+        NS_TEST_EXPECT_MSG_EQ(b.parameter1, 0.3, "share");
+        NS_TEST_EXPECT_MSG_EQ(b.smControlMessage.size(), 3u, "SM bytes carried");
+    }
+};
+
+class OranNtnE2PacketTransportTest : public TestCase
+{
+  public:
+    OranNtnE2PacketTransportTest()
+        : TestCase("W2-M2: E2 over the feeder as packets: setup and subscription precede "
+                   "indications; one-way delay = slant/c + serialization; outage loses messages")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        auto helper = CreateObject<OranNtnHelper>();
+        auto ric = helper->CreateNearRtRic();
+        NodeContainer sats;
+        sats.Create(1);
+        auto nodes = helper->CreateSatelliteE2Nodes(sats, ric);
+        auto e2 = nodes[0];
+        // A subscription as the RIC would create it for a KPM xApp.
+        E2Subscription sub{};
+        sub.ranFunctionId = 2;
+        sub.reportingPeriod = MilliSeconds(100);
+        sub.eventTrigger = false;
+        const uint32_t subId = ric->GetE2Termination()->CreateSubscription(1, sub);
+        NS_TEST_ASSERT_MSG_GT(subId, 0u, "subscription created");
+        uint32_t delivered = 0;
+        e2->SetIndicationCallback(
+            MakeBoundCallback(+[](uint32_t* n, E2Indication) { ++(*n); }, &delivered));
+        // Satellite 1000 km from the gateway, RIC 0 ms behind it.
+        auto sat = CreateObject<ConstantPositionMobilityModel>();
+        sat->SetPosition(Vector(0, 0, 1.0e6));
+        auto gw = CreateObject<ConstantPositionMobilityModel>();
+        gw->SetPosition(Vector(0, 0, 0));
+        auto tr = CreateObject<OranNtnE2Transport>();
+        tr->SetGatewayToRicDelay(Seconds(0));
+        tr->SetBearerRate(DataRate("100Mbps"));
+        tr->Attach(e2, sat, gw);
+        tr->Start(Seconds(0.0));
+        tr->ScheduleOutage(1, Seconds(2.0), Seconds(1.0));
+        E2KpmReport r{};
+        r.gnbId = 1;
+        r.isNtn = true;
+        r.sinr_dB = 10.0;
+        r.sinrMeasured = true;
+        for (int k = 0; k < 40; ++k)
+        {
+            // one report every 100 ms from t = 0 (the first ones precede the setup)
+            Simulator::Schedule(MilliSeconds(100 * k) + MicroSeconds(1),
+                                &OranNtnE2Node::SubmitKpmMeasurement, e2, r);
+        }
+        Simulator::Stop(Seconds(4.5));
+        Simulator::Run();
+        const auto& c = tr->GetCounters();
+        NS_TEST_EXPECT_MSG_EQ(c.setupDone, 1u, "E2 Setup completed");
+        NS_TEST_EXPECT_MSG_EQ(c.subscriptionsDone, 1u, "RIC Subscription completed");
+        NS_TEST_EXPECT_MSG_GT(c.indicationsBeforeSubscription, 0u,
+                              "the report at t=0 precedes the setup and is not sent");
+        NS_TEST_EXPECT_MSG_GT(tr->GetFirstIndicationTime(), tr->GetLastSetupDoneTime(),
+                              "first indication after the setup");
+        NS_TEST_EXPECT_MSG_GT(c.indicationsSent, c.indicationsReceived,
+                              "the outage lost indications");
+        NS_TEST_EXPECT_MSG_EQ(delivered, c.indicationsReceived, "each arrival dispatched");
+        NS_TEST_EXPECT_MSG_GT_OR_EQ(tr->GetMaxIndicationGapS(), 1.0, "outage gap >= 1 s");
+        // 1000 km / c = 3.3356 ms, plus serialization of < 1 kB at 100 Mb/s (< 0.1 ms)
+        NS_TEST_EXPECT_MSG_EQ_TOL(tr->GetIndicationOwdMeanMs(), 3.3356 + 0.05, 0.06,
+                                  "one-way delay = slant/c + serialization");
+        Simulator::Destroy();
+    }
+};
+
+
+/// Wave 7B: E2AP over a reliable transport (one ns-3 TCP connection per E2
+/// node, length-prefixed messages, SCTP stand-in). Shared driver: a 1000 km
+/// feeder, one KPM subscription at 100 ms, one report every 100 ms.
+namespace
+{
+struct E2TcpRun
+{
+    OranNtnE2Transport::Counters c;
+    double owdMeanMs{0};
+    double owdSdMs{0};
+    std::vector<double> arrivals; //!< RIC-side delivery instants (s)
+};
+
+E2TcpRun
+RunE2Transport(OranNtnE2Transport::Protocol proto,
+               double per,
+               double outageAt,
+               double outageS,
+               uint32_t maxRetrans,
+               double stopS,
+               uint32_t reports)
+{
+    RngSeedManager::SetSeed(7);
+    RngSeedManager::SetRun(1);
+    auto helper = CreateObject<OranNtnHelper>();
+    auto ric = helper->CreateNearRtRic();
+    NodeContainer sats;
+    sats.Create(1);
+    auto e2 = helper->CreateSatelliteE2Nodes(sats, ric)[0];
+    E2Subscription sub{};
+    sub.ranFunctionId = 2;
+    sub.reportingPeriod = MilliSeconds(100);
+    sub.eventTrigger = false;
+    ric->GetE2Termination()->CreateSubscription(1, sub);
+    E2TcpRun out;
+    e2->SetIndicationCallback(MakeBoundCallback(
+        +[](std::vector<double>* v, E2Indication) { v->push_back(Simulator::Now().GetSeconds()); },
+        &out.arrivals));
+    auto sat = CreateObject<ConstantPositionMobilityModel>();
+    sat->SetPosition(Vector(0, 0, 1.0e6));
+    auto gw = CreateObject<ConstantPositionMobilityModel>();
+    gw->SetPosition(Vector(0, 0, 0));
+    auto tr = CreateObject<OranNtnE2Transport>();
+    tr->SetProtocol(proto);
+    tr->SetAttribute("MaxRetrans", UintegerValue(maxRetrans));
+    tr->SetGatewayToRicDelay(Seconds(0));
+    tr->SetBearerRate(DataRate("2Mbps"));
+    tr->Attach(e2, sat, gw);
+    tr->SetFeederPacketErrorRate(per);
+    tr->Start(Seconds(0.0));
+    if (outageS > 0)
+    {
+        tr->ScheduleOutage(1, Seconds(outageAt), Seconds(outageS));
+    }
+    E2KpmReport r{};
+    r.gnbId = 1;
+    r.isNtn = true;
+    r.sinr_dB = 10.0;
+    r.sinrMeasured = true;
+    for (uint32_t k = 0; k < reports; ++k)
+    {
+        Simulator::Schedule(MilliSeconds(100 * k) + MicroSeconds(1),
+                            &OranNtnE2Node::SubmitKpmMeasurement, e2, r);
+    }
+    Simulator::Stop(Seconds(stopS));
+    Simulator::Run();
+    out.c = tr->GetCounters();
+    out.owdMeanMs = tr->GetIndicationOwdMeanMs();
+    out.owdSdMs = tr->GetIndicationOwdSdMs();
+    Simulator::Destroy();
+    return out;
+}
+} // namespace
+
+/// Normal path: on a feeder losing 5 % of packets each way, UDP loses
+/// indications while TCP delivers every one it accepted, in order, and the
+/// recovered ones carry their retransmission delay in the one-way delay.
+class OranNtnE2TcpLossyFeederTest : public TestCase
+{
+  public:
+    OranNtnE2TcpLossyFeederTest()
+        : TestCase("Wave 7B: E2AP over TCP delivers every indication in order over a lossy "
+                   "feeder; UDP loses them")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        using P = OranNtnE2Transport::Protocol;
+        const E2TcpRun udp = RunE2Transport(P::Udp, 0.05, 0, 0, 10, 32.0, 300);
+        const E2TcpRun tcp = RunE2Transport(P::Tcp, 0.05, 0, 0, 10, 32.0, 300);
+        NS_TEST_ASSERT_MSG_GT(udp.c.indicationsSent, 200u, "UDP: indications sent");
+        NS_TEST_EXPECT_MSG_LT(udp.c.indicationsReceived, udp.c.indicationsSent,
+                              "UDP: 5 % PER loses indications");
+        NS_TEST_ASSERT_MSG_EQ(tcp.c.connectionsEstablished, 1u, "TCP: one connection");
+        NS_TEST_EXPECT_MSG_EQ(tcp.c.setupDone, 1u, "TCP: E2 Setup completed");
+        NS_TEST_EXPECT_MSG_EQ(tcp.c.subscriptionsDone, 1u, "TCP: subscription completed");
+        NS_TEST_ASSERT_MSG_GT(tcp.c.indicationsSent, 200u, "TCP: indications sent");
+        NS_TEST_EXPECT_MSG_EQ(tcp.c.indicationsReceived, tcp.c.indicationsSent,
+                              "TCP: every indication sent is delivered (2 s drain margin)");
+        NS_TEST_EXPECT_MSG_EQ(tcp.c.outOfOrder, 0u, "TCP: in order");
+        NS_TEST_EXPECT_MSG_EQ(tcp.c.decodeFailures, 0u, "TCP: stream reassembly decodes all");
+        NS_TEST_EXPECT_MSG_EQ(tcp.arrivals.size(), tcp.c.indicationsReceived, "each dispatched");
+        // Floor: 1000 km / c = 3.34 ms. Retransmitted messages wait at least a
+        // fast-retransmit round, so the mean and the spread exceed UDP's.
+        NS_TEST_EXPECT_MSG_GT(udp.owdMeanMs, 3.33, "UDP owd >= propagation");
+        NS_TEST_EXPECT_MSG_GT(tcp.owdMeanMs, udp.owdMeanMs + 1.0,
+                              "TCP owd includes retransmission and head-of-line waits");
+        NS_TEST_EXPECT_MSG_GT(tcp.owdSdMs, 10.0 * udp.owdSdMs, "TCP delay spread from recovery");
+        // Lossless control: TCP and UDP deliver everything at the same floor
+        // (propagation plus serialization of the same E2AP bytes; the headers
+        // differ by a few bytes).
+        const E2TcpRun clean = RunE2Transport(P::Tcp, 0.0, 0, 0, 10, 32.0, 300);
+        const E2TcpRun cleanUdp = RunE2Transport(P::Udp, 0.0, 0, 0, 10, 32.0, 300);
+        std::cout << "[E2 TCP test] owd ms: udp lossy " << udp.owdMeanMs << " sd " << udp.owdSdMs
+                  << ", tcp lossy " << tcp.owdMeanMs << " sd " << tcp.owdSdMs << ", tcp clean "
+                  << clean.owdMeanMs << ", udp clean " << cleanUdp.owdMeanMs << "; udp lossy rx "
+                  << udp.c.indicationsReceived << "/" << udp.c.indicationsSent << "\n";
+        NS_TEST_EXPECT_MSG_EQ(clean.c.indicationsReceived, clean.c.indicationsSent, "clean");
+        NS_TEST_EXPECT_MSG_EQ(cleanUdp.c.indicationsReceived, cleanUdp.c.indicationsSent, "clean");
+        NS_TEST_EXPECT_MSG_GT(cleanUdp.owdMeanMs, 3.3356, "UDP clean owd >= slant / c");
+        NS_TEST_EXPECT_MSG_EQ_TOL(clean.owdMeanMs, cleanUdp.owdMeanMs, 0.3,
+                                  "clean TCP owd = clean UDP owd (no retransmission)");
+    }
+};
+
+/// Failure path: a 30 s feeder outage outlasts MaxRetrans = 3, so the
+/// connection is declared lost. Nothing is delivered during the outage,
+/// indications while the connection is down are counted and not sent, and
+/// after the feeder returns the agent re-connects, repeats E2 Setup and the
+/// RIC re-subscribes before indications flow again.
+class OranNtnE2TcpAssociationLossTest : public TestCase
+{
+  public:
+    OranNtnE2TcpAssociationLossTest()
+        : TestCase("Wave 7B: E2AP over TCP: a feeder outage past MaxRetrans loses the "
+                   "connection; re-connection repeats E2 Setup")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        using P = OranNtnE2Transport::Protocol;
+        const E2TcpRun tcp = RunE2Transport(P::Tcp, 0.0, 2.0, 30.0, 3, 50.0, 480);
+        NS_TEST_EXPECT_MSG_GT_OR_EQ(tcp.c.associationsLost, 1u, "connection declared lost");
+        NS_TEST_EXPECT_MSG_GT(tcp.c.indicationsNoAssociation, 0u,
+                              "indications while down are counted");
+        NS_TEST_EXPECT_MSG_GT_OR_EQ(tcp.c.connectionsEstablished, 2u, "re-connected");
+        NS_TEST_EXPECT_MSG_GT_OR_EQ(tcp.c.setupDone, 2u, "E2 Setup repeated");
+        NS_TEST_EXPECT_MSG_GT_OR_EQ(tcp.c.subscriptionsDone, 2u, "RIC re-subscribed");
+        NS_TEST_EXPECT_MSG_LT(tcp.c.indicationsReceived, tcp.c.indicationsSent,
+                              "in-flight messages die with the connection");
+        uint32_t during = 0;
+        uint32_t after = 0;
+        for (double t : tcp.arrivals)
+        {
+            during += (t > 2.01 && t < 32.0) ? 1 : 0;
+            after += t >= 32.0 ? 1 : 0;
+        }
+        NS_TEST_EXPECT_MSG_EQ(during, 0u, "nothing crosses the feeder during the outage");
+        NS_TEST_EXPECT_MSG_GT(after, 50u, "indications resume after re-establishment");
+        // UDP on the same outage has no association to lose: it resumes at once,
+        // but every message sent into the outage is gone.
+        const E2TcpRun udp = RunE2Transport(P::Udp, 0.0, 2.0, 30.0, 3, 50.0, 480);
+        NS_TEST_EXPECT_MSG_EQ(udp.c.setupDone, 1u, "UDP: one setup");
+        NS_TEST_EXPECT_MSG_GT(udp.c.indicationsSent - udp.c.indicationsReceived, 250u,
+                              "UDP loses the outage's indications");
+    }
+};
+
+/// Wave 6B: the E2 transport delay is the sum of its hops from live geometry.
+/// A regenerative gNB on a moving satellite reaches a ground RIC over one ISL
+/// and a feeder link plus fixed backhaul; the E2 node's one-way delay follows
+/// the path every 100 ms (normal path). After Unbind the delay is frozen while
+/// the geometry moves on (failure path: a stale binding shows as a mismatch).
+class OranNtnE2PathPerHopTest : public TestCase
+{
+  public:
+    OranNtnE2PathPerHopTest()
+        : TestCase("Wave 6B: E2 loop latency includes ISL + feeder + backhaul per hop")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        constexpr double kC = 299792458.0;
+        auto sat = CreateObject<ConstantVelocityMobilityModel>();
+        sat->SetPosition(Vector(0, 0, 600e3));
+        sat->SetVelocity(Vector(7500, 0, 0));
+        auto nb = CreateObject<ConstantVelocityMobilityModel>();
+        nb->SetPosition(Vector(700e3, 0, 600e3));
+        nb->SetVelocity(Vector(7500, 0, 0));
+        auto gw = CreateObject<ConstantPositionMobilityModel>();
+        gw->SetPosition(Vector(1200e3, 0, 0));
+        auto e2 = CreateObject<OranNtnE2Node>();
+        auto path = CreateObject<OranNtnE2Path>();
+        path->AddGeometricHop("isl1", OranNtnE2Path::HopKind::ISL, sat, nb);
+        path->AddGeometricHop("feeder", OranNtnE2Path::HopKind::FEEDER_LINK, nb, gw);
+        path->AddFixedHop("gw-ric", OranNtnE2Path::HopKind::TERRESTRIAL, MilliSeconds(5));
+
+        std::vector<std::pair<Time, Time>> seen; // (bound delay, recomputed path)
+        path->BindToE2Node(e2, MilliSeconds(100));
+        for (int t = 1; t <= 10; ++t)
+        {
+            Simulator::Schedule(Seconds(t) + MilliSeconds(1), [&]() {
+                seen.emplace_back(e2->GetFeederLinkDelay(), path->ComputeOneWay());
+            });
+        }
+        Time frozen;
+        Simulator::Schedule(Seconds(11), [&]() {
+            path->Unbind();
+            frozen = e2->GetFeederLinkDelay();
+        });
+        Time afterUnbind;
+        Time pathAfter;
+        Simulator::Schedule(Seconds(40), [&]() {
+            afterUnbind = e2->GetFeederLinkDelay();
+            pathAfter = path->ComputeOneWay();
+        });
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(seen.size(), 10u, "ten samples");
+        for (const auto& [bound, now] : seen)
+        {
+            // refreshed at most 100 ms ago: under 0.1 s x 7.5 km/s = 750 m = 2.5 us
+            NS_TEST_ASSERT_MSG_LT(std::abs((bound - now).GetSeconds()), 3e-6,
+                                  "E2 node delay tracks the whole path");
+        }
+        std::vector<OranNtnE2Path::HopSample> hs;
+        const Time total = path->ComputeOneWay(&hs);
+        NS_TEST_ASSERT_MSG_EQ(hs.size(), 3u, "three hops reported");
+        NS_TEST_ASSERT_MSG_EQ_TOL(hs[0].delay.GetSeconds(), 700e3 / kC, 1e-9,
+                                  "the ISL keeps its 700 km (same velocity)");
+        NS_TEST_ASSERT_MSG_EQ(hs[2].delay, MilliSeconds(5), "backhaul is fixed");
+        NS_TEST_ASSERT_MSG_EQ_TOL(total.GetSeconds(),
+                                  hs[0].delay.GetSeconds() + hs[1].delay.GetSeconds() + 0.005,
+                                  1e-12,
+                                  "total is the sum");
+        NS_TEST_ASSERT_MSG_GT(total, hs[1].delay, "the feeder alone understates the path");
+        const auto& st = path->GetHopStats();
+        NS_TEST_ASSERT_MSG_GT(st[1].maxMs, st[1].minMs, "the feeder hop moved with the satellite");
+        std::ostringstream csv;
+        path->WriteLoopBudgetCsv(csv, 50.0);
+        NS_TEST_ASSERT_MSG_NE(csv.str().find("loop_total"), std::string::npos, "loop row written");
+        NS_TEST_ASSERT_MSG_NE(csv.str().find("isl1,isl"), std::string::npos, "ISL row written");
+        NS_TEST_ASSERT_MSG_EQ(afterUnbind, frozen, "no refresh after Unbind");
+        NS_TEST_ASSERT_MSG_NE(pathAfter, frozen, "the real path changed meanwhile");
+        Simulator::Destroy();
+    }
+};
+
+/// Wave 6B: A1TD policy status. Normal path: an applicable policy is ENFORCED
+/// and the Non-RT RIC learns it one A1 delay later; at validUntil it lapses
+/// and reports NOT_ENFORCED / OTHER_REASON. Failure paths: an unsupported
+/// statement and a foreign scope are NOT_ENFORCED with their reasons and are
+/// not handed to xApps; a policy arriving after validUntil is OTHER_REASON.
+class OranNtnA1EnforceStatusTest : public TestCase
+{
+  public:
+    OranNtnA1EnforceStatusTest()
+        : TestCase("Wave 6B: A1 enforceStatus / enforceReason reported to the Non-RT RIC")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        auto nonRt = CreateObject<OranNtnA1PolicyManager>();
+        auto a1 = CreateObject<OranNtnA1Adapter>();
+        nonRt->SetDeliveryDelay(MilliSeconds(20));
+        nonRt->SetDistributionCallback(MakeCallback(&OranNtnA1Adapter::HandleIncomingPolicy, a1));
+        a1->SetStatusCallback(MakeCallback(&OranNtnA1PolicyManager::HandlePolicyStatus, nonRt));
+        a1->SetFeedbackDelay(MilliSeconds(20));
+        a1->AddManagedScope("satellite:7");
+        a1->AddSupportedPolicyType(A1PolicyType::BEAM_PRIORITY);
+        auto mk = [](uint32_t id, A1PolicyType t, std::string scope, Time until) {
+            A1NtnPolicy p{};
+            p.policyId = id;
+            p.type = t;
+            p.scope = scope;
+            p.active = true;
+            p.validUntil = until;
+            return p;
+        };
+        Simulator::Schedule(Seconds(1), [&]() {
+            nonRt->DistributePolicyForTest(
+                mk(1, A1PolicyType::BEAM_PRIORITY, "satellite:7", Seconds(5)));
+            nonRt->DistributePolicyForTest(
+                mk(2, A1PolicyType::ENERGY_SAVING, "satellite:7", Seconds(0)));
+            nonRt->DistributePolicyForTest(
+                mk(3, A1PolicyType::BEAM_PRIORITY, "satellite:99", Seconds(0)));
+            nonRt->DistributePolicyForTest(
+                mk(4, A1PolicyType::BEAM_PRIORITY, "global", Seconds(1.01)));
+        });
+        size_t activeAt2 = 0;
+        Simulator::Schedule(Seconds(2), [&]() { activeAt2 = a1->GetActivePolicies().size(); });
+        double shareAt9 = 0.0;
+        Simulator::Schedule(Seconds(9), [&]() { shareAt9 = nonRt->GetEnforcedTimeShare(1); });
+        Simulator::Run();
+
+        NS_TEST_ASSERT_MSG_EQ(activeAt2, 1u, "only the applicable policy reaches xApps");
+        auto s1 = nonRt->GetPolicyStatus(1);
+        NS_TEST_ASSERT_MSG_EQ((s1.status == A1EnforceStatus::NOT_ENFORCED), true,
+                              "lapsed at validUntil");
+        NS_TEST_ASSERT_MSG_EQ((s1.reason == A1EnforceReason::OTHER_REASON), true, "OTHER_REASON");
+        NS_TEST_ASSERT_MSG_EQ(
+            (nonRt->GetPolicyStatus(2).reason == A1EnforceReason::STATEMENT_NOT_APPLICABLE),
+            true,
+            "unsupported statement");
+        NS_TEST_ASSERT_MSG_EQ(
+            (nonRt->GetPolicyStatus(3).reason == A1EnforceReason::SCOPE_NOT_APPLICABLE),
+            true,
+            "foreign scope");
+        NS_TEST_ASSERT_MSG_EQ((nonRt->GetPolicyStatus(4).reason == A1EnforceReason::OTHER_REASON),
+                              true,
+                              "arrived after validUntil");
+        const auto& h = nonRt->GetStatusHistory();
+        NS_TEST_ASSERT_MSG_EQ(h.size(), 5u, "4 arrivals + 1 lapse");
+        NS_TEST_ASSERT_MSG_EQ((h[0].status == A1EnforceStatus::ENFORCED), true, "first ENFORCED");
+        NS_TEST_ASSERT_MSG_EQ(h[0].reportedAt, Seconds(1) + MilliSeconds(20), "issued on arrival");
+        NS_TEST_ASSERT_MSG_EQ(h[0].receivedAt, Seconds(1) + MilliSeconds(40), "one A1 delay back");
+        NS_TEST_ASSERT_MSG_EQ(h.back().reportedAt, Seconds(5), "lapse reported at validUntil");
+        // ENFORCED from 1.02 s to 5 s, then not: share over [1.02, 9] = 3.98 / 7.98.
+        NS_TEST_ASSERT_MSG_EQ_TOL(shareAt9, 3.98 / 7.98, 1e-6, "enforced time share");
+        NS_TEST_ASSERT_MSG_EQ(nonRt->GetViolationCount(), 4u, "NOT_ENFORCED reports counted");
+        std::ostringstream csv;
+        nonRt->WritePolicyStatusCsv(csv);
+        NS_TEST_ASSERT_MSG_NE(csv.str().find("SCOPE_NOT_APPLICABLE"), std::string::npos, "csv");
+        Simulator::Destroy();
+    }
+};
+
+/// Wave 6B: TS 28.552 V20.4.0 naming of PRB usage. RRU.PrbDl (5.1.1.2.1) is a
+/// percentage, RRU.PrbUsedDl (5.1.1.2.5) a mean count; both are in the
+/// canonical stream and RRU.PrbDl rides the E2 KPM payload. Built inside
+/// Simulator::Run; a report without PRB data marks RRU.PrbDl not present.
+class OranNtnKpmPrbNamingTest : public TestCase
+{
+  public:
+    OranNtnKpmPrbNamingTest()
+        : TestCase("Wave 6B: RRU.PrbDl percent vs RRU.PrbUsedDl count (TS 28.552 V20.4.0)")
+    {
+    }
+
+  private:
+    void DoRun() override
+    {
+        std::vector<oranntn::KpmMeasurement> withPrb;
+        std::vector<oranntn::KpmMeasurement> withoutPrb;
+        E2KpmReport decoded{};
+        bool decodeOk = false;
+        Simulator::Schedule(Seconds(1), [&]() {
+            E2KpmReport r{};
+            r.prbAvailDl = 51.0;
+            r.prbUsedDl = 25.5;
+            r.prbUtilization = 0.5;
+            r.prbMeasured = true;
+            const std::map<std::string, std::string> base = {{oranntn::label::kFiveQi, "9"},
+                                                             {oranntn::label::kSnssai, "1-000001"},
+                                                             {oranntn::label::kPlmn, "00101"}};
+            withPrb = oranntn::BuildCanonicalKpmMeasurements(r, base);
+            E2KpmReport empty{};
+            empty.prbUtilization = std::nan("");
+            withoutPrb = oranntn::BuildCanonicalKpmMeasurements(empty, base);
+            decodeOk = OranNtnE2Transport::DecodeKpm(OranNtnE2Transport::EncodeKpm(r), decoded);
+        });
+        Simulator::Run();
+        Simulator::Destroy();
+        auto find = [](const std::vector<oranntn::KpmMeasurement>& v, const std::string& id) {
+            for (const auto& m : v)
+            {
+                if (m.metricId == id)
+                {
+                    return m;
+                }
+            }
+            return oranntn::KpmMeasurement{"", -1.0, {}, ""};
+        };
+        const auto pct = find(withPrb, "RRU.PrbDl");
+        const auto used = find(withPrb, "RRU.PrbUsedDl");
+        NS_TEST_ASSERT_MSG_EQ(pct.metricId, "RRU.PrbDl", "percentage counter present");
+        NS_TEST_ASSERT_MSG_EQ_TOL(pct.value, 50.0, 1e-12, "integer percent 0..100");
+        NS_TEST_ASSERT_MSG_EQ_TOL(used.value, 25.5, 1e-12, "RRU.PrbUsedDl is the PRB count");
+        NS_TEST_ASSERT_MSG_EQ(pct.provenance, "measured", "measured provenance");
+        const auto none = find(withoutPrb, "RRU.PrbDl");
+        NS_TEST_ASSERT_MSG_EQ((none.labels.count("present") ? none.labels.at("present")
+                                                            : std::string()),
+                              "false",
+                              "no PRB data: RRU.PrbDl not present");
+        NS_TEST_ASSERT_MSG_EQ(decodeOk, true, "KPM payload decodes");
+        NS_TEST_ASSERT_MSG_EQ_TOL(decoded.prbUtilization, 0.5, 1e-9, "RRU.PrbDl round-trips");
+    }
+};
+
 class OranNtnTestSuite : public TestSuite
 {
   public:
@@ -7477,6 +8168,7 @@ class OranNtnTestSuite : public TestSuite
         AddTestCase(new A1GuidedConsultsPolicyTest, TestCase::Duration::QUICK);
         AddTestCase(new RcStyle3WireRoundTripTest, TestCase::Duration::QUICK);
         AddTestCase(new OranNtnRicTestCase, TestCase::Duration::QUICK);
+        AddTestCase(new OranNtnNoRadioMeasurementTestCase, TestCase::Duration::QUICK);
         AddTestCase(new OranNtnE2TestCase, TestCase::Duration::QUICK);
         // E2 loop-timing realism: return-path RC delay, control-loop
         // alignment, Unix-epoch timestamp offset.
@@ -7915,6 +8607,14 @@ class OranNtnPhyKpmUsesStandardTablesTest : public TestCase
                     TestCase::Duration::QUICK);
         AddTestCase(new OranNtnLoopLatencyProbeTest,
                     TestCase::Duration::QUICK);
+        AddTestCase(new OranNtnAdmissionRefusesUnactuatedXappsTest, TestCase::Duration::QUICK);
+        AddTestCase(new OranNtnE2KpmPayloadRoundTripTest, TestCase::Duration::QUICK);
+        AddTestCase(new OranNtnE2PacketTransportTest, TestCase::Duration::QUICK);
+        AddTestCase(new OranNtnE2PathPerHopTest, TestCase::Duration::QUICK);
+        AddTestCase(new OranNtnE2TcpLossyFeederTest, TestCase::Duration::QUICK);
+        AddTestCase(new OranNtnE2TcpAssociationLossTest, TestCase::Duration::QUICK);
+        AddTestCase(new OranNtnA1EnforceStatusTest, TestCase::Duration::QUICK);
+        AddTestCase(new OranNtnKpmPrbNamingTest, TestCase::Duration::QUICK);
     }
 };
 

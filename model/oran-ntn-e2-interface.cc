@@ -6,6 +6,8 @@
  */
 
 #include "oran-ntn-e2-interface.h"
+
+#include "oran-ntn-e2-transport.h"
 #include "oran-ntn-rc-style3.h"
 #include "oran-ntn-service-model-rc.h"
 
@@ -125,6 +127,7 @@ OranNtnE2Node::DoDispose()
     m_rcActionCb = MakeNullCallback<bool, E2RcAction>();
     m_indicationCb = MakeNullCallback<void, E2Indication>();
     m_loopProbe = nullptr;
+    m_transport = nullptr;
     Object::DoDispose();
 }
 
@@ -183,6 +186,16 @@ OranNtnE2Node::HandleSubscriptionRequest(const E2Subscription& sub)
         return false;
     }
 
+    // A request for an id that is already active replaces it (E2AP RIC
+    // Subscription Modification semantics). The old report timer used to keep
+    // running next to the new one, so a re-subscription doubled the indication
+    // rate and the old period never stopped.
+    auto old = m_reportTimers.find(sub.subscriptionId);
+    if (old != m_reportTimers.end())
+    {
+        Simulator::Cancel(old->second);
+        m_reportTimers.erase(old);
+    }
     m_subscriptions[sub.subscriptionId] = sub;
 
     // Start periodic reporting if configured
@@ -257,10 +270,19 @@ OranNtnE2Node::SubmitKpmMeasurement(const E2KpmReport& report)
         }
 
         // Check event trigger if applicable
+        // E2SM-KPM periodic report style: with periodic reporting on, a
+        // periodic subscription reports on its timer only. Emitting on every
+        // measurement as well doubled the indication stream (measurement rate
+        // plus reporting rate) the moment SetPeriodicReporting was enabled.
+        if (!sub.eventTrigger && m_periodicReporting && sub.reportingPeriod.IsStrictlyPositive())
+        {
+            continue;
+        }
         if (sub.eventTrigger)
         {
             bool triggered = false;
-            if (report.sinr_dB < sub.eventThreshold)
+            // A report without a radio measurement cannot satisfy a SINR condition.
+            if (report.radioValid && report.sinr_dB < sub.eventThreshold)
             {
                 triggered = true;
             }
@@ -292,6 +314,13 @@ OranNtnE2Node::EmitIndication(const E2Subscription& sub, const E2KpmReport& repo
     {
         indication.isBuffered = false;
         indication.deliveryDelay = m_feederLinkDelay;
+        if (m_transport)
+        {
+            // Wave 2 M2: the indication crosses the feeder as a packet; its
+            // delivery delay is measured on arrival.
+            m_transport->SendIndication(this, indication);
+            return;
+        }
         // Schedule delivery with feeder link delay
         Simulator::Schedule(m_feederLinkDelay,
                             &OranNtnE2Node::DeliverReport,
@@ -334,12 +363,21 @@ OranNtnE2Node::FlushBufferedReports()
 {
     NS_LOG_FUNCTION(this);
     Time now = Simulator::Now();
+    // maxBufferAge was declared and CheckBufferAge() implemented, but nothing
+    // called it, so a long feeder outage delivered every stale report on
+    // restoration. Age the buffer out before it is flushed.
+    CheckBufferAge();
 
     while (!m_reportBuffer.empty())
     {
         E2Indication ind = m_reportBuffer.front();
         m_reportBuffer.pop_front();
         ind.deliveryDelay = now - ind.originalTimestamp + m_feederLinkDelay;
+        if (m_transport)
+        {
+            m_transport->SendIndication(this, ind);
+            continue;
+        }
         Simulator::Schedule(m_feederLinkDelay,
                             &OranNtnE2Node::DeliverReport,
                             this,
@@ -442,11 +480,41 @@ OranNtnE2Node::ReceiveRcAction(const E2RcAction& action)
     // itself is not simulated; see the class doc).
     // The routing instant travels with the event so the downlink leg is
     // MEASURED at actuation time rather than assumed to equal FeederLinkDelay.
+    if (m_transport)
+    {
+        // Wave 2 M2: RIC Control as a packet over the feeder.
+        m_transport->SendControl(this, action);
+        return;
+    }
     Simulator::Schedule(m_feederLinkDelay,
                         &OranNtnE2Node::ExecuteRcActionEvent,
                         this,
                         action,
                         Simulator::Now());
+}
+
+void
+OranNtnE2Node::SetPacketTransport(Ptr<OranNtnE2Transport> t)
+{
+    m_transport = t;
+}
+
+Ptr<OranNtnE2Transport>
+OranNtnE2Node::GetPacketTransport() const
+{
+    return m_transport;
+}
+
+void
+OranNtnE2Node::DeliverFromTransport(const E2Indication& indication)
+{
+    DeliverReport(indication);
+}
+
+void
+OranNtnE2Node::ExecuteFromTransport(const E2RcAction& action, Time routedAt)
+{
+    ExecuteRcActionEvent(action, routedAt);
 }
 
 void
@@ -626,7 +694,8 @@ OranNtnE2Node::CheckBufferAge()
         if (sub != m_subscriptions.end())
         {
             Time age = now - it->originalTimestamp;
-            if (age > sub->second.maxBufferAge)
+            // A zero (unset) maxBufferAge means no age limit.
+            if (sub->second.maxBufferAge.IsStrictlyPositive() && age > sub->second.maxBufferAge)
             {
                 it = m_reportBuffer.erase(it);
                 m_totalReportsDropped++;

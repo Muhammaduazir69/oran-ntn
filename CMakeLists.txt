@@ -1,6 +1,8 @@
 set(source_files
     # Core O-RAN framework
     model/oran-ntn-e2-interface.cc
+    model/oran-ntn-e2-path.cc
+    model/oran-ntn-gated-error-model.cc
     model/oran-ntn-a1-interface.cc
     model/oran-ntn-conflict-manager.cc
     model/oran-ntn-xapp-base.cc
@@ -83,14 +85,20 @@ set(source_files
     # WS4 — payload options / FH split / platform spec / role switch
     model/oran-ntn-fh-split.cc
     model/ntn-platform-spec.cc
+    # Wave 2 M2: E2 as packets over the feeder (opt-in)
+    model/oran-ntn-e2-transport.cc
     # Helper
     helper/oran-ntn-helper.cc
+    # Wave 2 M2: actuator registry + measured KPM producer on NtnRealStackHelper
+    helper/oran-ntn-real-stack-binding.cc
 )
 
 set(header_files
     # Core O-RAN framework
     model/oran-ntn-types.h
     model/oran-ntn-e2-interface.h
+    model/oran-ntn-e2-path.h
+    model/oran-ntn-gated-error-model.h
     model/oran-ntn-a1-interface.h
     model/oran-ntn-conflict-manager.h
     model/oran-ntn-xapp-base.h
@@ -175,8 +183,10 @@ set(header_files
     # WS4 — payload options / FH split / platform spec / role switch
     model/oran-ntn-fh-split.h
     model/ntn-platform-spec.h
+    model/oran-ntn-e2-transport.h
     # Helper
     helper/oran-ntn-helper.h
+    helper/oran-ntn-real-stack-binding.h
 )
 
 set(test_sources
@@ -184,6 +194,7 @@ set(test_sources
     test/oran-ntn-multi-tier-ric-test.cc
     test/oran-ntn-feeder-mgmt-test.cc
     test/oran-ntn-ws4-test.cc
+    test/oran-ntn-indepth-test.cc
 )
 
 set(oran_ntn_extra_libs "")
@@ -222,12 +233,21 @@ build_lib(
         ${libspectrum}
         ${libpropagation}
         ${libinternet}
+        ${libpoint-to-point}
         ${libapplications}
         ${libsatellite}
         ${libmmwave}
         ${libns3-ai-ntn}
         ${libntn-traffic}
         ${libntn-slice}
+        ${libnr}
+        ${libthz-ntn}
         ${oran_ntn_extra_libs}
     TEST_SOURCES ${test_sources}
 )
+
+# The in-depth suite (oran-ntn-indepth) measures a UDP flow with FlowMonitor
+# and feeds it into the E2 node. Only the test library links flow-monitor.
+if(TARGET oran-ntn-test)
+  target_link_libraries(oran-ntn-test ${libflow-monitor})
+endif()

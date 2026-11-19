@@ -36,6 +36,8 @@
 #include <algorithm>
 #include <cmath>
 #include <fstream>
+#include <string>
+#include <sstream>
 #include <sys/stat.h>
 #include <vector>
 
@@ -114,6 +116,10 @@ OranNtnHelper::ConnectA1Interface(Ptr<OranNtnNearRtRic> nearRtRic,
     // Near-RT RIC sends enforcement feedback back to Non-RT RIC
     a1Adapter->SetFeedbackCallback(
         MakeCallback(&OranNtnA1PolicyManager::HandlePolicyFeedback, nonRtRic));
+    // Wave 6B: A1TD policy status (enforceStatus / enforceReason), with the
+    // same A1 delay back as the policy took forward.
+    a1Adapter->SetStatusCallback(MakeCallback(&OranNtnA1PolicyManager::HandlePolicyStatus, nonRtRic));
+    a1Adapter->SetFeedbackDelay(nonRtRic->GetDeliveryDelay());
 
     NS_LOG_INFO("OranNtnHelper: Connected A1 interface between Non-RT RIC and Near-RT RIC");
 }
@@ -133,7 +139,11 @@ OranNtnHelper::CreateSatelliteE2Nodes(NodeContainer satNodes,
         e2node->SetNodeId(i + 1); // 1-indexed
         e2node->SetIsNtn(true);
 
-        // Estimate feeder link delay from LEO altitude (~550 km -> ~3.7 ms round trip)
+        // Placeholder one-way feeder delay (a 550 km satellite at zenith is
+        // 1.83 ms one way; at the 10 deg gateway mask about 6.6 ms). It is a
+        // constant: a scenario with real geometry must drive it from the live
+        // satellite-gateway slant (OranNtnRicPlacement::BindToGeometry or a
+        // periodic SetFeederLinkDelay), as the examples now do.
         e2node->SetFeederLinkDelay(MilliSeconds(4));
         e2node->SetOnBoardBufferSize(500);
 
@@ -362,7 +372,180 @@ OranNtnHelper::CreateAllXapps(Ptr<OranNtnNearRtRic> ric)
 
     NS_LOG_INFO("OranNtnHelper: Created and registered " << xapps.size()
                 << " xApps");
+    // ORAN-13 follow-up (Wave 2 M2): the dispatcher reports each actuation back
+    // to the issuing xApp through m_allXapps, which nothing ever filled, so
+    // xapp_metrics.csv actuated_actions was 0 even for actuated actions.
+    for (const auto& [name, x] : xapps)
+    {
+        m_allXapps[name] = x;
+    }
     return xapps;
+}
+
+std::vector<E2RcActionType>
+OranNtnHelper::GetXappActionTypes(const std::string& name)
+{
+    using T = E2RcActionType;
+    // What each catalogue xApp emits (grep of BuildAction/actionType in
+    // model/oran-ntn-xapp-*.cc, 16 Nov 2026).
+    static const std::map<std::string, std::vector<E2RcActionType>> kTypes = {
+        {"ho-predict", {T::HANDOVER_TRIGGER}},
+        {"beam-hop", {T::BEAM_HOP_SCHEDULE}},
+        {"slice-manager", {T::SLICE_PRB_ALLOCATION}},
+        {"doppler-comp", {T::DOPPLER_COMP_UPDATE}},
+        {"tn-ntn-steering", {T::HANDOVER_TRIGGER}},
+        {"energy-harvest", {T::BEAM_SHUTDOWN, T::COMPUTE_THROTTLE}},
+        {"interference-mgmt", {T::BEAM_SWITCH, T::INTERFERENCE_NULLING, T::TX_POWER_CONTROL}},
+        {"isac", {T::ACTION_THZ_ISAC_MODE}},
+        {"multi-conn", {T::DC_SETUP, T::DC_TEARDOWN, T::BEARER_SPLIT}},
+        {"predictive-alloc", {T::PRB_RESERVATION}},
+        {"thz-beam-mgmt", {T::ACTION_THZ_BEAM_CODEBOOK}},
+        {"thz-ris", {T::ACTION_THZ_RIS_CONFIG}},
+        {"thz-spectrum", {T::ACTION_THZ_FREQ_SELECT, T::ACTION_THZ_WINDOW_HOP}},
+    };
+    auto it = kTypes.find(name);
+    return it == kTypes.end() ? std::vector<E2RcActionType>{} : it->second;
+}
+
+std::map<std::string, Ptr<OranNtnXappBase>>
+OranNtnHelper::CreateAdmittedXapps(Ptr<OranNtnNearRtRic> ric)
+{
+    NS_LOG_FUNCTION(this);
+    std::map<std::string, Ptr<OranNtnXappBase>> admitted;
+    m_admission.clear();
+    struct Entry
+    {
+        std::string name;
+        uint8_t prio;
+        Time interval;
+        std::function<Ptr<OranNtnXappBase>()> make;
+    };
+    // Same names, priorities and decision intervals as CreateAllXapps().
+    const std::vector<Entry> catalogue = {
+        {"ho-predict", 10, MilliSeconds(100), [] { return CreateObject<OranNtnXappHoPredict>(); }},
+        {"beam-hop", 20, MilliSeconds(200), [] { return CreateObject<OranNtnXappBeamHop>(); }},
+        {"slice-manager", 30, MilliSeconds(500),
+         [] { return CreateObject<OranNtnXappSliceManager>(); }},
+        {"doppler-comp", 15, MilliSeconds(200),
+         [] { return CreateObject<OranNtnXappDopplerComp>(); }},
+        {"tn-ntn-steering", 25, MilliSeconds(500),
+         [] { return CreateObject<OranNtnXappTnNtnSteering>(); }},
+        {"energy-harvest", 40, MilliSeconds(1000),
+         [] { return CreateObject<OranNtnXappEnergyHarvest>(); }},
+        {"interference-mgmt", 22, MilliSeconds(200),
+         [] { return CreateObject<OranNtnXappInterferenceMgmt>(); }},
+        {"isac", 35, MilliSeconds(500), [] { return CreateObject<OranNtnXappIsac>(); }},
+        {"multi-conn", 28, MilliSeconds(300), [] { return CreateObject<OranNtnXappMultiConn>(); }},
+        {"predictive-alloc", 18, MilliSeconds(200),
+         [] { return CreateObject<OranNtnXappPredictiveAlloc>(); }},
+        {"thz-beam-mgmt", 26, MilliSeconds(200),
+         [] { return CreateObject<OranNtnXappThzBeamMgmt>(); }},
+        {"thz-ris", 27, MilliSeconds(300), [] { return CreateObject<OranNtnXappThzRis>(); }},
+        {"thz-spectrum", 24, MilliSeconds(300),
+         [] { return CreateObject<OranNtnXappThzSpectrum>(); }},
+    };
+    for (const auto& e : catalogue)
+    {
+        AdmissionRecord rec;
+        rec.xappName = e.name;
+        std::ostringstream types;
+        std::ostringstream missing;
+        bool ok = true;
+        for (E2RcActionType t : GetXappActionTypes(e.name))
+        {
+            types << (types.tellp() > 0 ? ";" : "") << static_cast<uint32_t>(t);
+            if (!HasActuator(t))
+            {
+                ok = false;
+                missing << (missing.tellp() > 0 ? ";" : "") << static_cast<uint32_t>(t);
+            }
+        }
+        rec.actionTypes = types.str();
+        rec.admitted = ok;
+        rec.reason = ok ? std::string("all action types actuated")
+                        : "no actuator for action type(s) " + missing.str();
+        m_admission.push_back(rec);
+        if (!ok)
+        {
+            NS_LOG_WARN("OranNtnHelper: xApp " << e.name << " REFUSED: " << rec.reason);
+            continue;
+        }
+        Ptr<OranNtnXappBase> x = e.make();
+        x->SetXappName(e.name);
+        x->SetPriority(e.prio);
+        x->SetDecisionInterval(e.interval);
+        ric->RegisterXapp(x);
+        admitted[e.name] = x;
+        m_allXapps[e.name] = x;
+    }
+    return admitted;
+}
+
+void
+OranNtnHelper::RegisterActuator(E2RcActionType type,
+                                RcActuatorCallback cb,
+                                const std::string& name)
+{
+    m_actuators[static_cast<uint8_t>(type)] = RegisteredActuator{cb, name};
+}
+
+bool
+OranNtnHelper::HasActuator(E2RcActionType type) const
+{
+    if (m_actuators.count(static_cast<uint8_t>(type)))
+    {
+        return true;
+    }
+    switch (type)
+    {
+    case E2RcActionType::BEAM_SWITCH:
+    case E2RcActionType::BEAM_SHUTDOWN:
+        return !m_beamActuators.empty();
+    case E2RcActionType::HANDOVER_TRIGGER:
+    case E2RcActionType::HANDOVER_CANCEL:
+        return !m_handoverActuator.IsNull();
+    case E2RcActionType::SLICE_PRB_ALLOCATION:
+    case E2RcActionType::PRB_RESERVATION:
+        return !m_sliceActuator.IsNull();
+    default:
+        return false;
+    }
+}
+
+bool
+OranNtnHelper::SubmitKpmReport(const E2KpmReport& report)
+{
+    auto it = m_e2Nodes.find(report.gnbId);
+    if (it == m_e2Nodes.end())
+    {
+        NS_LOG_WARN("OranNtnHelper: E2 node " << report.gnbId << " not found for KPM submit");
+        return false;
+    }
+    it->second->SubmitKpmMeasurement(report);
+    m_kpmDataset.push_back(report);
+    return true;
+}
+
+uint64_t
+OranNtnHelper::GetTotalRouted() const
+{
+    uint64_t n = 0;
+    for (const auto& [t, c] : m_actuationCounters)
+    {
+        n += c.routed;
+    }
+    return n;
+}
+
+uint64_t
+OranNtnHelper::GetTotalActuated() const
+{
+    uint64_t n = 0;
+    for (const auto& [t, c] : m_actuationCounters)
+    {
+        n += c.actuated;
+    }
+    return n;
 }
 
 void
@@ -391,6 +574,7 @@ OranNtnHelper::GenerateConstellationPolicies(Ptr<OranNtnA1PolicyManager> nonRtRi
                                                double altitudeKm)
 {
     NS_LOG_FUNCTION(this);
+    m_shellAltitudeKm = altitudeKm; // InjectKpmReport's NTN delay uses the real shell
 
     // Generate orbit-aware HO threshold policies
     nonRtRic->GenerateOrbitAwarePolicies(numPlanes, satsPerPlane,
@@ -470,13 +654,16 @@ OranNtnHelper::InjectKpmReport(uint32_t gnbId, uint32_t ueId,
     report.tte_s = tte;
     report.elevation_deg = elevation;
     report.doppler_Hz = doppler;
-    // RSRQ = N·RSRP/RSSI. For a loaded cell this reduces to S/(S+I+N) per RE,
-    // i.e. SINR_lin/(1+SINR_lin), bounded to the 3GPP RSRQ range [-19.5,-3] dB.
-    // (The old `sinr - 3` produced physically-impossible positive RSRQ.)
+    // RSRQ = N·RSRP/RSSI (TS 38.215 §5.1.3). RSRP is the power of ONE resource
+    // element while the RSSI integrates all 12 subcarriers of each of the N
+    // RBs, so for a fully loaded cell RSRQ = SINR_lin / (12 (1 + SINR_lin)),
+    // whose ceiling is -10.8 dB. The previous form dropped the 1/12, so every
+    // report above ~3 dB SINR hit the -3 dB clamp and the column was a constant.
+    // Bounded to the TS 38.133 reporting range [-43, 20] dB.
     {
         double sinrLin = std::pow(10.0, sinr / 10.0);
-        report.rsrq_dB = std::max(-19.5, std::min(-3.0,
-                            10.0 * std::log10(sinrLin / (1.0 + sinrLin))));
+        report.rsrq_dB = std::max(-43.0, std::min(20.0,
+                            10.0 * std::log10(sinrLin / (12.0 * (1.0 + sinrLin)))));
     }
     // CQI derived from SINR via the 3GPP TS 38.214 Table 5.2.2.1-2 (CQI table 1)
     // efficiency breakpoints, NOT the old "sinr + 6" clamp. Monotonic SINR->CQI
@@ -522,13 +709,15 @@ OranNtnHelper::InjectKpmReport(uint32_t gnbId, uint32_t ueId,
         // Not measured: do NOT fabricate an error rate. NaN = "no measurement".
         report.harqBler = std::nan("");
     }
-    // Propagation delay from the actual slant range, derived from elevation for
-    // a LEO shell (h~600 km), instead of a single is_ntn constant. One-way
-    // user-plane latency = propagation + ~1 ms processing/scheduling.
+    // Propagation delay from the actual slant range, derived from elevation and
+    // the shell altitude (SetShellAltitudeKm / GenerateConstellationPolicies;
+    // it was a fixed 600 km for every scenario), instead of a single is_ntn
+    // constant. One-way user-plane latency = propagation + ~1 ms
+    // processing/scheduling.
     if (it->second->IsNtn())
     {
         const double Re = 6371.0;
-        const double h = 600.0;
+        const double h = m_shellAltitudeKm;
         const double e = elevation * M_PI / 180.0;
         const double slantKm =
             Re * (std::sqrt(std::pow((Re + h) / Re, 2.0) - std::cos(e) * std::cos(e)) -
@@ -558,30 +747,26 @@ OranNtnHelper::InjectKpmReport(uint32_t gnbId, uint32_t ueId,
     // activeUes: uint sentinel 0 = "not measured" (no active-UE count is plumbed
     // into this injector; the old 12+6*sin fabrication is removed).
     report.activeUes = 0;
-    // Cell throughput follows PRB utilisation; when PRB is unknown (NaN) this
-    // propagates NaN rather than fabricating a load-derived number.
-    report.cellThroughput_Mbps = report.prbUtilization * 273.0 * 0.75; // util x PRB x Mbps/PRB
-    // Assign slice based on UE modular grouping: eMBB=0, URLLC=1, mMTC=2
-    report.sliceId = static_cast<uint8_t>(ueId % 3);
-    // Slice-aware throughput/latency are DERIVED from the (measured-or-derived)
-    // per-UE throughput/latency, so they are kept. sliceReliability, however,
-    // was a hardcoded SLA TARGET (0.999/0.9999/0.99) masquerading as a measured
-    // packet-delivery ratio -- no delivery ratio is measured here, so emit NaN.
-    if (report.sliceId == 0) // eMBB
+    // Cell throughput: no cell-level measurement reaches this injector. It was
+    // util x 273 PRB x 0.75 Mbps/PRB, a fixed spectral-efficiency guess that
+    // ignored the cell's real bandwidth and MCS. Not measured -> NaN.
+    report.cellThroughput_Mbps = std::nan("");
+    // Slice of this UE: what the scenario declared (SetUeSliceId), else the
+    // legacy ueId % 3 grouping. eMBB=0, URLLC=1, mMTC=2.
     {
-        report.sliceThroughput_Mbps = report.throughput_Mbps;
-        report.sliceLatency_ms = report.latency_ms;
+        auto sit = m_ueSlice.find(ueId);
+        report.sliceId = (sit != m_ueSlice.end()) ? sit->second
+                                                  : static_cast<uint8_t>(ueId % 3);
     }
-    else if (report.sliceId == 1) // URLLC
-    {
-        report.sliceThroughput_Mbps = std::max(0.1, report.throughput_Mbps * 0.1);
-        report.sliceLatency_ms = report.latency_ms; // NTN latency violates URLLC SLA
-    }
-    else // mMTC
-    {
-        report.sliceThroughput_Mbps = std::max(0.01, report.throughput_Mbps * 0.02);
-        report.sliceLatency_ms = report.latency_ms * 2.0;
-    }
+    // A per-UE report contributes ITS OWN throughput and latency to its slice.
+    // URLLC used to be reported at 0.1 x and mMTC at 0.02 x the UE's
+    // throughput, and mMTC latency at 2 x: fixed scale factors with no
+    // measurement behind them, which the slice-manager xApp then acted on.
+    // sliceReliability was a hardcoded SLA TARGET (0.999/0.9999/0.99)
+    // masquerading as a measured packet-delivery ratio -- no delivery ratio is
+    // measured here, so emit NaN.
+    report.sliceThroughput_Mbps = report.throughput_Mbps;
+    report.sliceLatency_ms = report.latency_ms;
     report.sliceReliability = std::nan("");
 
     it->second->SubmitKpmMeasurement(report);
@@ -660,6 +845,14 @@ OranNtnHelper::DefaultRcActionHandler(E2RcAction action)
     // reported as a failure (never a silent accept), and the logged success is
     // exactly the value returned to the RIC (action_log <-> xapp_metrics agree).
     bool actuated = false;
+    auto reg = m_actuators.find(static_cast<uint8_t>(action.actionType));
+    if (reg != m_actuators.end())
+    {
+        // Wave 2 M2: a registered actuator (a binding to the measured radio)
+        // owns this action type.
+        actuated = reg->second.cb(action);
+    }
+    else
     switch (action.actionType)
     {
     case E2RcActionType::BEAM_SWITCH:
@@ -729,6 +922,15 @@ OranNtnHelper::DefaultRcActionHandler(E2RcAction action)
     entry.confidence = action.confidence;
     entry.success = actuated;
     m_actionLog.push_back(entry);
+    {
+        ActuationCounter& c = m_actuationCounters[static_cast<uint8_t>(action.actionType)];
+        ++c.routed;
+        c.actuated += actuated ? 1 : 0;
+    }
+    if (m_actionObserver)
+    {
+        m_actionObserver(action, actuated);
+    }
 
     // ORAN-13: tell the issuing xApp what actually happened. Its own
     // successfulActions counter records only that the RIC ROUTED the action;
@@ -827,6 +1029,30 @@ OranNtnHelper::WriteAllMetrics(Ptr<OranNtnNearRtRic> ric) const
                 << lmin << "," << lmax << "\n";
     }
 
+    // Wave 2 M2: routed vs actuated per RC action type, and the admission
+    // verdict of every catalogue xApp (empty when CreateAdmittedXapps was not used).
+    {
+        std::ofstream act(m_outputDir + "/actuator_summary.csv");
+        act << "action_type,actuator,routed,actuated\n";
+        for (const auto& [t, c] : m_actuationCounters)
+        {
+            auto r = m_actuators.find(t);
+            act << static_cast<uint32_t>(t) << ","
+                << (r != m_actuators.end() ? r->second.name : std::string("legacy-hook-or-none"))
+                << "," << c.routed << "," << c.actuated << "\n";
+        }
+        if (!m_admission.empty())
+        {
+            std::ofstream adm(m_outputDir + "/xapp_admission.csv");
+            adm << "xapp_name,admitted,action_types,reason\n";
+            for (const auto& a : m_admission)
+            {
+                adm << a.xappName << "," << (a.admitted ? 1 : 0) << "," << a.actionTypes << ","
+                    << a.reason << "\n";
+            }
+        }
+    }
+
     // Write Space RIC metrics
     if (!m_spaceRics.empty())
     {
@@ -885,17 +1111,39 @@ OranNtnHelper::WriteKpmDataset(const std::string& filename) const
            "prb_utilization,active_ues,cell_throughput_Mbps,"
            "slice_id,slice_throughput_Mbps,slice_latency_ms,slice_reliability\n";
 
+    // A metric the scenario does not measure is NaN in the record; write it as
+    // an empty field (the CSV convention for missing data), not the text "nan".
+    auto v = [](double x) -> std::string {
+        if (!std::isfinite(x))
+        {
+            return std::string();
+        }
+        std::ostringstream o;
+        o << x;
+        return o.str();
+    };
     for (const auto& r : m_kpmDataset)
     {
         ofs << r.timestamp << "," << r.gnbId << "," << (r.isNtn ? 1 : 0) << ","
-            << r.ueId << "," << r.rsrp_dBm << "," << r.rsrq_dB << ","
-            << r.sinr_dB << "," << (int)r.cqi << "," << r.throughput_Mbps << ","
-            << r.latency_ms << "," << r.elevation_deg << "," << r.doppler_Hz << ","
-            << r.propagationDelay_ms << "," << r.tte_s << "," << r.beamId << ","
-            << r.beamGain_dB << "," << r.prbUtilization << "," << r.activeUes << ","
-            << r.cellThroughput_Mbps << "," << (int)r.sliceId << ","
-            << r.sliceThroughput_Mbps << "," << r.sliceLatency_ms << ","
-            << r.sliceReliability << "\n";
+            << r.ueId << "," << v(r.rsrp_dBm) << "," << v(r.rsrq_dB) << ","
+            << v(r.sinr_dB) << ","
+            // CQI 0 is the TS 38.214 code for "out of range". A report that
+            // carries no CQI at all (the real-stack binding: cqiMeasured false,
+            // cqi left 0) wrote that code on every row, so a 20 dB link read as
+            // out of range. A 0 next to a SINR at or above the CQI-1 threshold
+            // (-6.7 dB, the table the injector derives from) cannot be a real
+            // CQI, so it is written empty like every other missing field; a 0
+            // with a SINR below it is a genuine "out of range" and is kept.
+            << ((r.cqi == 0 && !r.cqiMeasured && !(std::isfinite(r.sinr_dB) && r.sinr_dB < -6.7))
+                    ? std::string()
+                    : std::to_string((int)r.cqi))
+            << "," << v(r.throughput_Mbps) << ","
+            << v(r.latency_ms) << "," << v(r.elevation_deg) << "," << v(r.doppler_Hz) << ","
+            << v(r.propagationDelay_ms) << "," << v(r.tte_s) << "," << r.beamId << ","
+            << v(r.beamGain_dB) << "," << v(r.prbUtilization) << "," << r.activeUes << ","
+            << v(r.cellThroughput_Mbps) << "," << (int)r.sliceId << ","
+            << v(r.sliceThroughput_Mbps) << "," << v(r.sliceLatency_ms) << ","
+            << v(r.sliceReliability) << "\n";
     }
 
     NS_LOG_INFO("OranNtnHelper: Wrote " << m_kpmDataset.size()

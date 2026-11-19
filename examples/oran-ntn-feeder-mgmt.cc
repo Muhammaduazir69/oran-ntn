@@ -48,8 +48,82 @@
 //             heartbeat failover for unpredicted outages as in `reactive`
 //   pal-nopre pal without pre-provisioning (ablation)
 //   pal-gw    pal with ground-wins reconciliation (ablation)
+//   onboard-ttl  onboard, but the satellite's A1 copy carries the same lease
+//             as pal (renewed by an SMO refresh that names the held version,
+//             then the safe intent): the strongest on-board baseline (review D1)
+//   sat-pred  reactive-ttl-pre, plus satellite-side prediction (review
+//             R3-M4): the satellite itself enters autonomy T_lead before the
+//             loss its own on-board contact plan predicts, with no LEASE from
+//             the RIC, and resumes through the ground-wins path
+//   pred-ho   recent design (Baranda et al., IEEE OJ-COMS 2025): the RIC moves
+//             near-RT control on board before the ephemeris-predicted loss,
+//             as pal does, but the intent is held without expiry (the A1
+//             default), the next satellite is not provisioned and control
+//             returns through the ground-wins path
+//   ground-pre recent design (KubeSpace, Zhao et al. 2026): all classes stay
+//             on the ground, and the next serving satellite is provisioned
+//             (E2 setup and subscriptions) ahead of the switch from the
+//             predicted schedule
+//
+// User plane (Wave 7B, --upUes, default 4; 0 turns it off). The control
+// study above has no radio, so a measured user plane rides the same orbits and
+// the same feeder outages next to it, on its own nodes and links so it cannot
+// queue against or draw random numbers from the control plane (every control
+// random variable has a fixed stream, and --upUes=0 reproduces the control
+// results byte for byte):
+//   * UEs: TR 38.811 Section 6.1.1.1 UE classes drawn from the Maritime
+//     scenario mix (ntn-cho NtnTr38811MobilityHelper) in a 0.1 deg box at the
+//     cell (the cell sits in the Arabian Sea).
+//   * Uplink apps: ntn-traffic NtnOranApplication, conversational voice
+//     (5QI 1, 92 B every 20 ms) on even UEs and mMTC telemetry (5QI 9, 128 B
+//     every 1 s) on odd UEs, to an
+//     NtnOranSink at a UPF next to the RIC.
+//   * Service link UE -> serving satellite: point-to-point, delay = live
+//     slant / c (SGP4) refreshed every 100 ms, loss from ntn-constellation's
+//     NtnSatLinkErrorModel per packet on the live geometry with the TR 38.821
+//     Table 6.1.1.1-2 Set-1 S-band uplink budget (23 dBm handheld EIRP, 0 dBi,
+//     satellite G/T 1.1 dB/K, 360 kHz) plus P.676 gas and P.618
+//     scintillation. A satellite that is not serving drops everything.
+//   * Feeder satellite -> gateway: point-to-point per (satellite, gateway),
+//     live slant delay, down whenever the control plane's feeder for the same
+//     pair is down (contact windows, acquisition gaps, rain outages: the same
+//     state, read per packet), else NtnSatLinkErrorModel with a Ka-band feeder
+//     budget (19.7 GHz, 50 dBW EIRP, gateway G/T 35 dB/K, 250 MHz; rain is
+//     already the outage process, so P.618 rain is off here). Each satellite
+//     forwards to the gateway its control plane uses.
+//   * Gateway -> UPF: fibre at 1.5 x the great-circle distance at 2e8 m/s
+//     plus 2 ms, as the RIC backhaul.
+//   * Measured: FlowMonitor (IP), the sinks' in-band one-way delay, RFC 3550
+//     jitter and sequence-gap loss, the TS 28.552 KPM series of the
+//     NtnOranAiFlowMonitor (up_kpm_series.csv), up_flows.csv, and line
+//     protocol points (ntn-observability NtnInfluxSink, up.lp). Packets lost
+//     while the serving feeder is down are counted apart from the rest.
+//
+// Variants (all strategies): --softSwitch (Rel-17 make-before-break feeder
+// switch-over, no gap on a geometric gateway change), --linkDetectS (the
+// satellite enters autonomy on link-layer loss of carrier instead of the
+// heartbeat timeout), --arqRtoS (SCTP-like retransmission of KPM and control
+// datagrams), --a1Process (poisson, periodic or bursty intent updates).
+//
+// Near-RT fast (NF) outcome: the NF xApp is a beam-tracking controller. The
+// best beam of the cell follows a jump process; the ground runs the full
+// xApp (decision accuracy nfAccGround), the on-board Space RIC a reduced
+// (INT8) xApp whose accuracy is lower by delta. Missed or late NF epochs keep
+// a stale beam. The misaligned share of served time is reported for several
+// dwell times and accuracy gaps in one run (the decision does not feed back
+// into anything else, so all variants see the same dynamics).
 
 #include "ns3/applications-module.h"
+#include "ns3/constant-position-mobility-model.h"
+#include "ns3/flow-monitor-helper.h"
+#include "ns3/ipv4-flow-classifier.h"
+#include "ns3/ntn-influx-sink.h"
+#include "ns3/ntn-oran-ai-flow-monitor.h"
+#include "ns3/ntn-oran-application.h"
+#include "ns3/ntn-oran-sink.h"
+#include "ns3/ntn-realistic-mobility.h"
+#include "ns3/ntn-sat-link-error-model.h"
+#include "ns3/ntn-tr38811-mobility-model.h"
 #include "ns3/core-module.h"
 #include "ns3/internet-module.h"
 #include "ns3/network-module.h"
@@ -57,6 +131,7 @@
 #include "ns3/oran-ntn-authority-lease.h"
 #include "ns3/oran-ntn-contact-plan.h"
 #include "ns3/oran-ntn-flexric-types.h"
+#include "ns3/oran-ntn-gated-error-model.h"
 #include "ns3/oran-ntn-service-model-kpm.h"
 #include "ns3/point-to-point-module.h"
 #include "ns3/sgp4-mobility-model.h"
@@ -102,6 +177,7 @@ enum MsgType : uint8_t
     RECON = 12,
     RECON_ACK = 13,
     PREP = 14,
+    ARQ_ACK = 15,
 };
 
 class MgmtHeader : public Header
@@ -177,7 +253,11 @@ enum class Strategy
     ReactiveTtlPre,
     Pal,
     PalNoPre,
-    PalGw
+    PalGw,
+    OnboardTtl,
+    SatPred,
+    PredHo,
+    GroundPre
 };
 
 constexpr int kRT = 0;
@@ -226,6 +306,14 @@ struct Cfg
     std::array<double, kClasses> procOnboardS{0.001, 0.003, 0.010};
     uint32_t sctpPad{20};
     double procScaleOnboard{1.0};
+    bool softSwitch{false};    // Rel-17 soft feeder-link switch-over (D11)
+    double linkDetectS{-1.0};  // link-layer loss-of-carrier detection delay; <0 off (D12)
+    double arqRtoS{0.0};       // SCTP-like retransmission timeout; 0 off (D27)
+    uint32_t arqMax{2};        // retransmissions per datagram
+    std::string a1Process{"poisson"}; // poisson | periodic | bursty (D8)
+    double a1BurstCv2{4.0};    // squared coefficient of variation, bursty process
+    double nfAccGround{0.90};  // decision accuracy of the full (ground) NF xApp
+    uint32_t numBeams{16};
     std::string outDir{"oran-ntn-feeder-mgmt-output"};
     uint32_t run{1};
 };
@@ -301,6 +389,7 @@ struct Sat
     Ptr<OranNtnA1Adapter> a1;
     bool provisioned{false};
     Policy snap; // last policy snapshot received (re-anchored by heartbeats)
+    double leaseTauS{0}; // lease length carried by the last A1 put (onboard-ttl)
     // applied NS parameter
     double share{-1};
     uint32_t shareVer{0};
@@ -309,6 +398,9 @@ struct Sat
     double lastDemand{0};
     Time lastDemandAt{Seconds(0)};
     uint32_t seq{0};
+    // sat-pred: autonomy entered from the on-board contact plan (R3-M4)
+    bool predAuto{false};
+    Time predAt{Seconds(0)};
 };
 
 struct Stats
@@ -319,6 +411,10 @@ struct Stats
     // NS / policy
     uint64_t slaSamples{0}, slaViol{0};
     double overSum{0};
+    // Shortfall depth (review R2-M5): sum of (r - x)^+ over the samples, and
+    // the same sum over the samples counted as short (x < r - 0.01).
+    double shortSum{0}, shortSumViol{0};
+    uint64_t satPredEntries{0}; // sat-pred: predictive autonomy entries
     uint64_t nsDecisions{0}, nsSuperseded{0};
     std::vector<float> staleS; // time since the used version was superseded
     std::vector<float> policyAgeS;
@@ -332,7 +428,7 @@ struct Stats
         // loss of an established feeder, 3 takeover by a satellite with no
         // feeder yet, 4 still open at the end of the run (censored).
         int kind{2};
-        uint32_t direct{0}, policyStale{0};
+        uint32_t direct{0}, policyStale{0}, fallback{0};
         double ttc{-1};
         uint32_t nfMiss{0};
     };
@@ -356,6 +452,11 @@ struct Stats
     uint64_t kpmDiscarded{0}, kpmDelivered{0}, ctrlLost{0};
     double servedS{0}, linkUpServedS{0};
     uint64_t kpmCodecFail{0};
+    uint64_t mergeGroundApplied{0}; // RECON_ACKs that carried a ground-authoritative value (D5)
+    uint64_t nfOnbDecisions{0};     // NF decisions taken by the reduced on-board xApp
+    uint64_t nsOnbDecisions{0};
+    uint64_t arqRetx{0}, arqDup{0};
+    uint64_t mergeFallbackWrites{0}; // kept on-board writes under the safe intent (D10)
 };
 
 Stats st;
@@ -390,7 +491,7 @@ Policy smoCur;
 std::map<uint32_t, double> verIssued; // version -> issue time
 Ptr<OranNtnA1Adapter> ricA1;
 Policy ricPolicy;
-std::vector<L::Write> groundLog;
+std::map<int, std::vector<L::Write>> groundLog; // per satellite (D5)
 
 // Per-sat ground view
 struct GroundView
@@ -425,12 +526,159 @@ uint64_t rtGroundFeasibleTicks = 0, rtTicks = 0;
 // SLA violation breakdown: [linkUp][appliedVersionCurrent]
 uint64_t catSamp[4] = {0, 0, 0, 0}, catViol[4] = {0, 0, 0, 0};
 double catOver[4] = {0, 0, 0, 0};
+double catShort[4] = {0, 0, 0, 0}; // shortfall depth by state of the applied share
 uint64_t violBy[2][2] = {{0, 0}, {0, 0}}, sampBy[2][2] = {{0, 0}, {0, 0}};
 
 // Demand process
 uint32_t sessions = 0;
 Ptr<ExponentialRandomVariable> rvArr, rvHold, rvA1;
 Ptr<UniformRandomVariable> rvU, rvIntent;
+
+// ---------------------------------------------------------------------------
+// NF outcome: beam tracking (review D1, D4)
+// ---------------------------------------------------------------------------
+// The best beam of the cell jumps to a neighbouring beam as a Poisson process
+// with mean dwell kDwell[i]; the processes run on their own stream on a fixed
+// 10 ms grid, so they are identical for every strategy of a seed. An NF
+// decision picks the measured best beam with probability nfAccGround on the
+// ground (full FP32 xApp) and nfAccGround - kGap[j] on board (reduced INT8
+// xApp), and a neighbour otherwise. The applied beam is held until the next
+// actuated NF epoch; a missed or late epoch therefore keeps a stale beam.
+constexpr int kNT = 4;
+constexpr int kNG = 8;
+const double kDwell[kNT] = {0.5, 1.0, 2.0, 5.0};
+const double kGap[kNG] = {0.0, 0.005, 0.01, 0.015, 0.02, 0.03, 0.05, 0.10};
+int bestBeam[kNT] = {0, 0, 0, 0};
+int appliedBeam[kNT][kNG];
+uint64_t beamMis[kNT][kNG];
+uint64_t beamSamp = 0;
+int64_t lastNfAppliedNs = -1;
+Ptr<UniformRandomVariable> rvBeam, rvDec;
+std::map<int64_t, std::array<int, kNT>> nfMeasured; // NF epoch -> measured best beams
+std::map<int64_t, std::array<int, kNT>> rcBeam;     // NF epoch -> ground decision
+
+int
+WrongBeam(int m, double u)
+{
+    const int B = static_cast<int>(g.numBeams);
+    return (m + (u < 0.5 ? 1 : B - 1)) % B;
+}
+
+void
+ResetAppliedBeams()
+{
+    for (int i = 0; i < kNT; ++i)
+    {
+        for (int j = 0; j < kNG; ++j)
+        {
+            appliedBeam[i][j] = -1; // a new satellite has no beam applied yet
+        }
+    }
+    lastNfAppliedNs = -1;
+}
+
+void
+BeamTick()
+{
+    Simulator::Schedule(MilliSeconds(10), &BeamTick);
+    const int B = static_cast<int>(g.numBeams);
+    for (int i = 0; i < kNT; ++i)
+    {
+        const double u = rvBeam->GetValue();
+        const double d = rvBeam->GetValue();
+        if (u < 1.0 - std::exp(-0.01 / kDwell[i]))
+        {
+            bestBeam[i] = (bestBeam[i] + (d < 0.5 ? 1 : B - 1)) % B;
+        }
+    }
+    if (servingIdx < 0)
+    {
+        return;
+    }
+    ++beamSamp;
+    for (int i = 0; i < kNT; ++i)
+    {
+        for (int j = 0; j < kNG; ++j)
+        {
+            if (appliedBeam[i][j] != bestBeam[i])
+            {
+                ++beamMis[i][j];
+            }
+        }
+    }
+    // forget decisions of epochs that can no longer be applied in time
+    if (beamSamp % 100 == 0)
+    {
+        const int64_t cut = (Simulator::Now() - Seconds(5)).GetNanoSeconds();
+        while (!nfMeasured.empty() && nfMeasured.begin()->first < cut)
+        {
+            nfMeasured.erase(nfMeasured.begin());
+        }
+        while (!rcBeam.empty() && rcBeam.begin()->first < cut)
+        {
+            rcBeam.erase(rcBeam.begin());
+        }
+    }
+}
+
+// Ground (full xApp) decision for an NF epoch from the measured beams.
+std::array<int, kNT>
+GroundBeamDecision(const std::array<int, kNT>& m)
+{
+    const double x = rvDec->GetValue();
+    const double u = rvDec->GetValue();
+    std::array<int, kNT> d{};
+    for (int i = 0; i < kNT; ++i)
+    {
+        d[i] = x < g.nfAccGround ? m[i] : WrongBeam(m[i], u);
+    }
+    return d;
+}
+
+// Apply an NF action to the cell's beam state.
+void
+ApplyBeam(int64_t tMeasNs, L::Host writer)
+{
+    if (tMeasNs <= lastNfAppliedNs)
+    {
+        return; // an older action arriving after a newer one changes nothing
+    }
+    if (writer == L::Host::Ground)
+    {
+        auto it = rcBeam.find(tMeasNs);
+        if (it == rcBeam.end())
+        {
+            return;
+        }
+        for (int i = 0; i < kNT; ++i)
+        {
+            for (int j = 0; j < kNG; ++j)
+            {
+                appliedBeam[i][j] = it->second[i];
+            }
+        }
+    }
+    else
+    {
+        auto it = nfMeasured.find(tMeasNs);
+        if (it == nfMeasured.end())
+        {
+            return;
+        }
+        ++st.nfOnbDecisions;
+        const double x = rvDec->GetValue();
+        const double u = rvDec->GetValue();
+        for (int i = 0; i < kNT; ++i)
+        {
+            for (int j = 0; j < kNG; ++j)
+            {
+                appliedBeam[i][j] =
+                    x < g.nfAccGround - kGap[j] ? it->second[i] : WrongBeam(it->second[i], u);
+            }
+        }
+    }
+    lastNfAppliedNs = tMeasNs;
+}
 
 // Pending consistency tracking for the outage currently being restored.
 struct PendingTtc
@@ -513,23 +761,39 @@ ToA1(const Policy& p)
 }
 
 bool
+IsOnboardLike()
+{
+    return g.strat == Strategy::Onboard || g.strat == Strategy::OnboardTtl;
+}
+
+bool
 IsPal()
 {
-    return g.strat == Strategy::Pal || g.strat == Strategy::PalNoPre || g.strat == Strategy::PalGw;
+    return g.strat == Strategy::Pal || g.strat == Strategy::PalNoPre || g.strat == Strategy::PalGw ||
+           g.strat == Strategy::PredHo;
+}
+
+// Predictive strategies whose control returns through the ground-wins path.
+bool
+GroundWinsReturn()
+{
+    return g.strat == Strategy::PalGw || g.strat == Strategy::PredHo;
 }
 
 bool
 IsReactiveLike()
 {
     return g.strat == Strategy::Reactive || g.strat == Strategy::ReactiveTtl ||
-           g.strat == Strategy::ReactiveTtlPre;
+           g.strat == Strategy::ReactiveTtlPre || g.strat == Strategy::SatPred;
 }
 
 // Strategies whose satellite-side A1 copy carries a validUntil lease.
 bool
 IsLeasing()
 {
-    return IsPal() || g.strat == Strategy::ReactiveTtl || g.strat == Strategy::ReactiveTtlPre;
+    return (IsPal() && g.strat != Strategy::PredHo) || g.strat == Strategy::ReactiveTtl ||
+           g.strat == Strategy::ReactiveTtlPre || g.strat == Strategy::OnboardTtl ||
+           g.strat == Strategy::SatPred;
 }
 
 // Strategies that provision the next serving satellite in advance.
@@ -537,7 +801,8 @@ bool
 UsesPreprov()
 {
     return g.strat == Strategy::Pal || g.strat == Strategy::PalGw ||
-           g.strat == Strategy::ReactiveTtlPre;
+           g.strat == Strategy::ReactiveTtlPre || g.strat == Strategy::SatPred ||
+           g.strat == Strategy::GroundPre;
 }
 
 bool
@@ -574,6 +839,8 @@ PayloadSize(uint8_t type, uint32_t n)
         return 64;
     case PREP:
         return 40;
+    case ARQ_ACK:
+        return 16;
     default:
         return 0;
     }
@@ -588,7 +855,7 @@ MakePkt(const MgmtHeader& h, uint32_t payload)
 }
 
 Ptr<Packet>
-MakeKpm(MgmtHeader h, double value)
+MakeKpm(MgmtHeader h, const std::vector<double>& values)
 {
     // E2SM-KPM Indication Format 1 body, produced by the module codec.
     using namespace oranntn::flexric::kpm_v3;
@@ -597,11 +864,14 @@ MakeKpm(MgmtHeader h, double value)
     meas_info_format_1_lst_t mi;
     mi.meas_type.form = meas_type_form_t::name;
     mi.meas_type.meas_name = h.cls == kNS ? "RRU.PrbUsedDl" : "DRB.UEThpDl";
-    meas_record_item_t rec;
-    rec.form = meas_value_form_t::real;
-    rec.int_val = 0;
-    rec.real_val = value;
-    mi.meas_record_lst.push_back(rec);
+    for (double value : values)
+    {
+        meas_record_item_t rec;
+        rec.form = meas_value_form_t::real;
+        rec.int_val = 0;
+        rec.real_val = value;
+        mi.meas_record_lst.push_back(rec);
+    }
     label_info_t lab;
     lab.s_nssai = "01-000001";
     mi.label_info_lst.push_back(lab);
@@ -615,7 +885,7 @@ MakeKpm(MgmtHeader h, double value)
 }
 
 bool
-DecodeKpm(Ptr<Packet> p, double& value)
+DecodeKpm(Ptr<Packet> p, std::vector<double>& values)
 {
     const uint32_t n = p->GetSize() - g.sctpPad;
     std::vector<uint8_t> bytes(n);
@@ -627,7 +897,11 @@ DecodeKpm(Ptr<Packet> p, double& value)
     {
         return false;
     }
-    value = out.meas_info_lst[0].meas_record_lst[0].real_val;
+    values.clear();
+    for (const auto& r : out.meas_info_lst[0].meas_record_lst)
+    {
+        values.push_back(r.real_val);
+    }
     return true;
 }
 
@@ -654,7 +928,7 @@ std::map<int, std::pair<uint64_t, uint32_t>> preSig;
 void
 AccountFeeder(int s, uint8_t type, Ptr<Packet> p, bool preSwitch)
 {
-    const uint32_t bytes = p->GetSize() + 28; // + IPv4 + UDP
+    const uint32_t bytes = p->GetSize() + 30; // + IPv4 + UDP + PPP (D30)
     st.feederBytes += bytes;
     st.feederPkts += 1;
     st.bytesByType[type] += bytes;
@@ -681,6 +955,28 @@ IsServing(int s)
 struct GroundView;
 bool RicSeesUp(int s);
 
+// SCTP-like reliability for the near-RT datagrams (D27): with --arqRtoS > 0,
+// every KPM indication and RIC control is acknowledged by the receiver
+// (16-byte ack) and retransmitted after the timeout, up to arqMax times;
+// duplicates are recognized by sequence number and not acted on twice.
+struct ArqPend
+{
+    MgmtHeader h;
+    uint32_t payload{0};
+    Ptr<Packet> p;
+    uint32_t tries{0};
+};
+std::map<std::pair<int, uint32_t>, ArqPend> arqSat, arqRic;
+std::set<std::pair<int, uint32_t>> seenAtRic, seenAtSat;
+uint32_t ricSeq = 0;
+bool
+ArqOn()
+{
+    return g.arqRtoS > 0;
+}
+void ArqRicTimer(int s, uint32_t seq);
+void ArqSatTimer(int s, uint32_t seq);
+
 void
 SendToSat(int s, MgmtHeader h, uint32_t payload, bool fromSmo = false)
 {
@@ -698,6 +994,11 @@ SendToSat(int s, MgmtHeader h, uint32_t payload, bool fromSmo = false)
     h.tSendNs = Simulator::Now().GetNanoSeconds();
     Ptr<Packet> p = MakePkt(h, payload);
     AccountFeeder(s, h.type, p, !IsServing(s));
+    if (ArqOn() && h.type == RC_CTRL && !arqRic.count({s, h.seq}))
+    {
+        arqRic[{s, h.seq}] = ArqPend{h, payload, nullptr, 0};
+        Simulator::Schedule(Seconds(g.arqRtoS), &ArqRicTimer, s, h.seq);
+    }
     Ptr<Socket> sock = fromSmo ? smoSock : ricSock;
     sock->SendTo(p, 0, InetSocketAddress(sat.addrSat[gw], kSatPort));
 }
@@ -706,10 +1007,59 @@ void
 SendFromSat(int s, Ptr<Packet> p, uint8_t type, bool toSmo = false)
 {
     AccountFeeder(s, type, p, !IsServing(s));
+    if (ArqOn() && type == KPM_IND)
+    {
+        MgmtHeader hh;
+        p->PeekHeader(hh);
+        if (!arqSat.count({s, hh.seq}))
+        {
+            arqSat[{s, hh.seq}] = ArqPend{hh, 0, p->Copy(), 0};
+            Simulator::Schedule(Seconds(g.arqRtoS), &ArqSatTimer, s, hh.seq);
+        }
+    }
     sats[s].sock->SendTo(p,
                          0,
                          InetSocketAddress(toSmo ? smoAddr : ricAddrToSmo,
                                            toSmo ? kSmoPort : kRicPort));
+}
+
+void
+ArqRicTimer(int s, uint32_t seq)
+{
+    auto it = arqRic.find({s, seq});
+    if (it == arqRic.end())
+    {
+        return;
+    }
+    if (it->second.tries >= g.arqMax || !IsServing(s))
+    {
+        arqRic.erase(it);
+        return;
+    }
+    ++it->second.tries;
+    ++st.arqRetx;
+    SendToSat(s, it->second.h, it->second.payload);
+    Simulator::Schedule(Seconds(g.arqRtoS), &ArqRicTimer, s, seq);
+}
+
+void
+ArqSatTimer(int s, uint32_t seq)
+{
+    auto it = arqSat.find({s, seq});
+    if (it == arqSat.end())
+    {
+        return;
+    }
+    if (it->second.tries >= g.arqMax || !IsServing(s))
+    {
+        arqSat.erase(it);
+        return;
+    }
+    ++it->second.tries;
+    ++st.arqRetx;
+    Ptr<Packet> c = it->second.p->Copy();
+    SendFromSat(s, c, KPM_IND);
+    Simulator::Schedule(Seconds(g.arqRtoS), &ArqSatTimer, s, seq);
 }
 
 void
@@ -730,12 +1080,15 @@ HostedOnboard(int cls, const Sat& s)
     switch (g.strat)
     {
     case Strategy::Ground:
+    case Strategy::GroundPre:
         return false;
     case Strategy::Onboard:
+    case Strategy::OnboardTtl:
         return true;
     case Strategy::Reactive:
     case Strategy::ReactiveTtl:
     case Strategy::ReactiveTtlPre:
+    case Strategy::SatPred:
         return cls == kRT || s.autonomous;
     default:
         // PAL pins RT on board: the placement rule is evaluated for RT every
@@ -749,6 +1102,8 @@ HostedOnboard(int cls, const Sat& s)
 // SLA / staleness bookkeeping
 // ---------------------------------------------------------------------------
 uint64_t nsFallback = 0;
+uint64_t softSwitches = 0;
+void EnterAutonomy(int s);
 // NF epoch bookkeeping for miss attribution: epoch time -> state code at the
 // epoch (bit0 link up, bit1 hosted on board, bit2 E2 set up, bit3 subscribed,
 // bit4 autonomous, bit5 leased, bit6 within 5 s after a switch).
@@ -839,6 +1194,7 @@ ApplyAction(int s, int cls, Time tMeas, double value, uint32_t ver, L::Host writ
     {
         nfPending.erase(tMeas.GetNanoSeconds());
         nfMissed.erase(tMeas.GetNanoSeconds());
+        ApplyBeam(tMeas.GetNanoSeconds(), writer);
     }
     if (cls == kNF && switchPending && curSwitch < st.switches.size() &&
         st.switches[curSwitch].blackoutNf < 0 && st.switches[curSwitch].to == sat.id)
@@ -855,8 +1211,9 @@ ApplyAction(int s, int cls, Time tMeas, double value, uint32_t ver, L::Host writ
         bool confirming;
         if (writer == L::Host::Onboard)
         {
+            ++st.nsOnbDecisions;
             sat.log.push_back({1, value, ver, tMeas, L::Host::Onboard});
-            confirming = (g.strat == Strategy::Onboard);
+            confirming = IsOnboardLike();
         }
         else
         {
@@ -888,6 +1245,15 @@ Epoch(int cls)
     {
         sat.lastDemand = demand;
         sat.lastDemandAt = tMeas;
+    }
+    std::array<int, kNT> meas{};
+    if (cls == kNF)
+    {
+        for (int i = 0; i < kNT; ++i)
+        {
+            meas[i] = bestBeam[i];
+        }
+        nfMeasured[tMeas.GetNanoSeconds()] = meas;
     }
     if (cls == kNF && switchPending && curSwitch < st.switches.size() &&
         st.switches[curSwitch].firstEpochS < 0)
@@ -943,7 +1309,23 @@ Epoch(int cls)
     h.seq = ++sat.seq;
     h.tMeasNs = tMeas.GetNanoSeconds();
     h.v2 = demand;
-    Ptr<Packet> p = MakeKpm(h, cls == kNS ? demand : rvU->GetValue());
+    std::vector<double> kv;
+    if (cls == kNS)
+    {
+        kv.push_back(demand);
+    }
+    else if (cls == kNF)
+    {
+        for (int i = 0; i < kNT; ++i)
+        {
+            kv.push_back(meas[i]); // measured best-beam index, one record per dwell setting
+        }
+    }
+    else
+    {
+        kv.push_back(rvU->GetValue());
+    }
+    Ptr<Packet> p = MakeKpm(h, kv);
     if (sat.linkUp)
     {
         // Re-stamp send time right before sending.
@@ -1023,12 +1405,15 @@ GroundNeedsSub(int cls)
     switch (g.strat)
     {
     case Strategy::Ground:
+    case Strategy::GroundPre:
         return true;
     case Strategy::Onboard:
+    case Strategy::OnboardTtl:
         return false;
     case Strategy::Reactive:
     case Strategy::ReactiveTtl:
     case Strategy::ReactiveTtlPre:
+    case Strategy::SatPred:
         return cls != kRT;
     default:
         return cls != kRT; // pal: RT is never placed on the ground (predicted loop > 10 ms)
@@ -1036,6 +1421,7 @@ GroundNeedsSub(int cls)
 }
 
 void PushPolicyToSat(int s, bool lease);
+int64_t OnbLeaseUntilNs();
 
 void
 RicOnSetup(int s)
@@ -1054,7 +1440,7 @@ RicOnSetup(int s)
             SendToSat(s, q, PayloadSize(SUB_REQ, 0));
         }
     }
-    if (g.strat == Strategy::Onboard)
+    if (IsOnboardLike())
     {
         // The RIC notifies the SMO, which PUTs the current policy on the
         // satellite's A1 termination (with retries until acknowledged).
@@ -1063,6 +1449,7 @@ RicOnSetup(int s)
         a.ver = smoCur.ver;
         a.v1 = smoCur.g;
         a.v2 = smoCur.h;
+        a.untilNs = OnbLeaseUntilNs();
         SendToSat(s, a, PayloadSize(A1_PUT, 0), true);
     }
     else if (IsReactiveLike())
@@ -1071,7 +1458,7 @@ RicOnSetup(int s)
     }
     else if (IsPal())
     {
-        PushPolicyToSat(s, true);
+        PushPolicyToSat(s, IsLeasing());
     }
 }
 
@@ -1087,18 +1474,52 @@ PredLoss(int s)
     {
         return now;
     }
+    Time end = now;
     for (const auto& w : planPred->GetPairWindows(sat.id, sat.activeGw))
     {
         if (now >= w.start && now < w.end)
         {
-            return w.end;
+            end = w.end;
+            break;
         }
         if (w.start > now)
         {
             break;
         }
     }
-    return now; // the plan already expects no contact on this gateway
+    if (!g.softSwitch || end == now)
+    {
+        return end; // the plan already expects no contact on this gateway if end == now
+    }
+    // With soft switch-over the contact continues on any gateway whose
+    // predicted window already covers the edge (make-before-break).
+    int cur = sat.activeGw;
+    for (int hop = 0; hop < 8; ++hop)
+    {
+        bool extended = false;
+        for (int j = 0; j < static_cast<int>(g.numGw) && !extended; ++j)
+        {
+            if (j == cur)
+            {
+                continue;
+            }
+            for (const auto& w : planPred->GetPairWindows(sat.id, j))
+            {
+                if (w.start <= end - MilliSeconds(20) && w.end > end + MilliSeconds(20))
+                {
+                    end = w.end;
+                    cur = j;
+                    extended = true;
+                    break;
+                }
+            }
+        }
+        if (!extended)
+        {
+            break;
+        }
+    }
+    return end;
 }
 
 // The RIC's estimate of the mean A1 update spacing: prior plus observations.
@@ -1123,6 +1544,14 @@ PredictedLeaseUntil(int /*s*/)
     return Simulator::Now() + LeaseTau();
 }
 
+// onboard-ttl: the SMO puts the intent with the same lease horizon (0 = no
+// expiry, the A1 default, for onboard).
+int64_t
+OnbLeaseUntilNs()
+{
+    return g.strat == Strategy::OnboardTtl ? PredictedLeaseUntil(0).GetNanoSeconds() : 0;
+}
+
 void
 PushPolicyToSat(int s, bool lease)
 {
@@ -1142,12 +1571,21 @@ PushPolicyToSat(int s, bool lease)
 void
 SatInstallPolicy(int s, uint32_t ver, double gg, double hh, Time until)
 {
-    Policy p{ver, gg, hh, until};
-    if (ver >= sats[s].snap.ver || until > sats[s].snap.until)
+    // Versions never regress on board (D20): an older version is ignored,
+    // the same version only renews its lease, a newer one replaces it.
+    Sat& sat = sats[s];
+    if (ver < sat.snap.ver)
     {
-        sats[s].snap = p;
+        return;
     }
-    sats[s].a1->HandleIncomingPolicy(ToA1(p));
+    Policy p{ver, gg, hh, until};
+    if (ver == sat.snap.ver && sat.snap.ver > 0)
+    {
+        const bool forever = until <= Seconds(0) || sat.snap.until <= Seconds(0);
+        p.until = forever ? Seconds(0) : std::max(until, sat.snap.until);
+    }
+    sat.snap = p;
+    sat.a1->HandleIncomingPolicy(ToA1(p));
 }
 
 // Ground-wins resume (reactive hybrid and the PAL ablation): leave autonomy
@@ -1158,6 +1596,7 @@ SatResume(int s)
 {
     Sat& sat = sats[s];
     sat.autonomous = false;
+    sat.predAuto = false;
     // Link-up is contact: restart the heartbeat timeout here, or the next
     // check would put the satellite straight back into autonomy before any
     // ground message has had time to arrive.
@@ -1167,6 +1606,7 @@ SatResume(int s)
     MgmtHeader r;
     r.type = HB_ACK;
     r.flags = 1;
+    r.untilNs = sat.autonomyStart.GetNanoSeconds(); // t0 of the on-board log (M4b)
     r.v2 = Demand();
     r.tMeasNs = Simulator::Now().GetNanoSeconds();
     r.ver = sat.shareVer;
@@ -1202,6 +1642,7 @@ SatSendRecon(int s)
     r.ver = sat.shareVer;
     r.v1 = sat.share;
     r.v2 = Demand();
+    r.untilNs = sat.autonomyStart.GetNanoSeconds(); // t0 of the on-board log (M4b)
     r.tMeasNs = Simulator::Now().GetNanoSeconds();
     reconSnap[s] = sat.log;
     SendSatMsg(s, r, PayloadSize(RECON, static_cast<uint32_t>(sat.log.size())));
@@ -1226,8 +1667,25 @@ SatRecv(int s, Ptr<Socket> sock)
         switch (h.type)
         {
         case RC_CTRL:
+            if (ArqOn())
+            {
+                MgmtHeader a;
+                a.type = ARQ_ACK;
+                a.sat = static_cast<uint16_t>(s);
+                a.seq = h.seq;
+                a.tSendNs = Simulator::Now().GetNanoSeconds();
+                SendFromSat(s, MakePkt(a, PayloadSize(ARQ_ACK, 0)), ARQ_ACK);
+                if (!seenAtSat.insert({s, h.seq}).second)
+                {
+                    ++st.arqDup;
+                    break;
+                }
+            }
             ApplyAction(s, h.cls, NanoSeconds(h.tMeasNs), h.v1, h.ver, L::Host::Ground,
                         (h.flags & 16) == 0);
+            break;
+        case ARQ_ACK:
+            arqSat.erase({s, h.seq});
             break;
         case E2_SETUP_RSP:
             sat.e2Setup = true;
@@ -1242,11 +1700,26 @@ SatRecv(int s, Ptr<Socket> sock)
             break;
         }
         case A1_PUT: {
+            if (h.untilNs > 0)
+            {
+                sat.leaseTauS = (h.untilNs - h.tSendNs) * 1e-9;
+            }
+            if ((h.flags & 2) && h.ver <= sat.snap.ver)
+            {
+                // onboard-ttl lease refresh from the SMO: it names the current
+                // version, so only a held snapshot of that version is renewed
+                // (the same rule as the hybrids' heartbeat re-anchor, D20).
+                if (h.ver == sat.snap.ver)
+                {
+                    SatInstallPolicy(s, h.ver, h.v1, h.v2, NanoSeconds(h.untilNs));
+                }
+                break;
+            }
             SatInstallPolicy(s, h.ver, h.v1, h.v2, NanoSeconds(h.untilNs));
             MgmtHeader r;
             r.type = A1_ACK;
             r.ver = h.ver;
-            SendSatMsg(s, r, PayloadSize(A1_ACK, 0), g.strat == Strategy::Onboard);
+            SendSatMsg(s, r, PayloadSize(A1_ACK, 0), IsOnboardLike());
             break;
         }
         case LEASE: {
@@ -1272,12 +1745,30 @@ SatRecv(int s, Ptr<Socket> sock)
         }
         case HB: {
             const bool wasAuto = wasAutoAny && sat.autonomous;
-            if (h.untilNs > 0 && sat.snap.ver > 0)
+            if (h.untilNs > 0 && sat.snap.ver > 0 && sat.snap.ver == h.ver)
             {
-                // PAL: every contact re-anchors the lease of the held snapshot.
+                // Every contact re-anchors the lease of the held snapshot, but
+                // only if the heartbeat confirms that snapshot is still the
+                // RIC's current version (D20); a superseded one is replaced
+                // by the next policy push or RECON_ACK instead.
                 SatInstallPolicy(s, sat.snap.ver, sat.snap.g, sat.snap.h, NanoSeconds(h.untilNs));
             }
-            if (wasAuto && (!IsPal() || g.strat == Strategy::PalGw))
+            if (!IsServing(s))
+            {
+                // Heartbeat to a provisioned, not yet serving satellite (D16):
+                // it only keeps the snapshot's lease anchored.
+                break;
+            }
+            if (wasAuto && g.strat == Strategy::SatPred && sat.predAuto)
+            {
+                // sat-pred: autonomy taken from the on-board plan ahead of a
+                // predicted loss is kept while the feeder is still up; the
+                // satellite returns it itself (SatTick) or at link-up.
+                MgmtHeader r;
+                r.type = HB_ACK;
+                SendSatMsg(s, r, 0);
+            }
+            else if (wasAuto && (!IsPal() || GroundWinsReturn()))
             {
                 SatResume(s);
             }
@@ -1342,13 +1833,14 @@ RicDecideAndSend(int s, int cls, Time tMeas, double demand, bool recon = false)
         c.cls = static_cast<uint8_t>(cls);
         c.tMeasNs = tMeas.GetNanoSeconds();
         c.flags = recon ? 16 : 0;
+        c.seq = ++ricSeq;
         if (cls == kNS)
         {
             const Policy p = FromA1(*ricA1);
             c.v1 = Decide(demand, p);
             c.ver = p.ver;
             RecordNsDecision(p.ver);
-            groundLog.push_back({1, c.v1, c.ver, tMeas, L::Host::Ground});
+            groundLog[s].push_back({1, c.v1, c.ver, tMeas, L::Host::Ground});
         }
         SendToSat(s, c, PayloadSize(RC_CTRL, 0));
     });
@@ -1364,18 +1856,20 @@ ReconcileGroundWins(int s, const MgmtHeader& h)
     const Policy p = FromA1(*ricA1);
     const double gDecision = Decide(h.v2, p);
     std::vector<L::Write> gl = {{1, gDecision, p.ver, Simulator::Now(), L::Host::Ground}};
+    const Time t0 = h.untilNs > 0 ? NanoSeconds(h.untilNs) : gv.leaseStart; // from the message (M4b)
     auto m = L::Merge(L::MergeRule::GroundWins,
                       gl,
                       reconSnap[s],
-                      gv.leaseStart,
+                      t0,
                       Simulator::Now(),
-                      smoCur.ver,
+                      p.ver, // the RIC's own version, not the SMO's (D19)
                       0.01);
     if (pendTtc.sat == s)
     {
         auto& o = st.outages[pendTtc.outageIdx];
         o.direct += m.directConflicts;
         o.policyStale += m.policyStaleWrites;
+        o.fallback += m.fallbackWrites;
     }
     reconSnap[s].clear();
     PushPolicyToSat(s, IsLeasing());
@@ -1400,9 +1894,24 @@ RicRecv(Ptr<Socket> sock)
         gview[s].lastHbAck = Simulator::Now();
         switch (h.type)
         {
+        case ARQ_ACK:
+            arqRic.erase({s, h.seq});
+            break;
         case KPM_IND: {
-            double v = 0;
-            if (!DecodeKpm(p, v))
+            if (ArqOn())
+            {
+                MgmtHeader a;
+                a.type = ARQ_ACK;
+                a.seq = h.seq;
+                SendToSat(s, a, PayloadSize(ARQ_ACK, 0));
+                if (!seenAtRic.insert({s, h.seq}).second)
+                {
+                    ++st.arqDup;
+                    break;
+                }
+            }
+            std::vector<double> vv;
+            if (!DecodeKpm(p, vv))
             {
                 ++st.kpmCodecFail;
                 break;
@@ -1418,7 +1927,16 @@ RicRecv(Ptr<Socket> sock)
             {
                 gview[s].leased[h.cls] = false; // the grant did not arrive; re-grant
             }
-            RicDecideAndSend(s, h.cls, tMeas, h.cls == kNS ? v : 0.0);
+            if (h.cls == kNF && vv.size() == static_cast<size_t>(kNT))
+            {
+                std::array<int, kNT> m{};
+                for (int i = 0; i < kNT; ++i)
+                {
+                    m[i] = static_cast<int>(std::lround(vv[i]));
+                }
+                rcBeam[h.tMeasNs] = GroundBeamDecision(m); // rides in the 32-byte control payload
+            }
+            RicDecideAndSend(s, h.cls, tMeas, h.cls == kNS ? vv[0] : 0.0);
             break;
         }
         case E2_SETUP_REQ:
@@ -1435,7 +1953,7 @@ RicRecv(Ptr<Socket> sock)
             if (h.flags & 1)
             {
                 gv.autonomous = false;
-                if (IsReactiveLike() || g.strat == Strategy::PalGw)
+                if (IsReactiveLike() || GroundWinsReturn())
                 {
                     ReconcileGroundWins(s, h);
                 }
@@ -1450,18 +1968,38 @@ RicRecv(Ptr<Socket> sock)
             GroundView& gv = gview[s];
             const Policy cur = FromA1(*ricA1);
             const std::vector<L::Write> ol = reconSnap[s];
+            const Time t0 = h.untilNs > 0 ? NanoSeconds(h.untilNs) : gv.leaseStart; // (M4b)
             auto m = L::Merge(L::MergeRule::LeaseVersioned,
-                              groundLog,
+                              groundLog[s],
                               ol,
-                              gv.leaseStart,
+                              t0,
                               Simulator::Now(),
                               cur.ver,
                               0.01);
+            // Direct conflicts are counted with the same definition as on the
+            // ground-wins path: the latest on-board write of the lease against
+            // the ground's fresh decision from the measurement in this message
+            // (D3), so the column compares like with like.
+            uint32_t direct = 0;
+            if (h.v2 >= 0)
+            {
+                std::vector<L::Write> gl = {
+                    {1, Decide(h.v2, cur), cur.ver, Simulator::Now(), L::Host::Ground}};
+                direct = L::Merge(L::MergeRule::GroundWins,
+                                  gl,
+                                  ol,
+                                  t0,
+                                  Simulator::Now(),
+                                  cur.ver,
+                                  0.01)
+                             .directConflicts;
+            }
             if (pendTtc.sat == s)
             {
                 auto& o = st.outages[pendTtc.outageIdx];
-                o.direct += m.directConflicts;
+                o.direct += direct;
                 o.policyStale += m.policyStaleWrites;
+                o.fallback += m.fallbackWrites;
             }
             reconSnap[s].clear();
             gv.autonomous = false;
@@ -1470,7 +2008,7 @@ RicRecv(Ptr<Socket> sock)
             r.ver = cur.ver;
             r.v1 = cur.g;
             r.v2 = cur.h;
-            r.untilNs = PredictedLeaseUntil(s).GetNanoSeconds();
+            r.untilNs = IsLeasing() ? PredictedLeaseUntil(s).GetNanoSeconds() : 0;
             r.flags = 0;
             for (int c = 0; c < kClasses; ++c)
             {
@@ -1488,7 +2026,23 @@ RicRecv(Ptr<Socket> sock)
                 r.seq = static_cast<uint32_t>(std::lround(share * 1e6));
                 r.tMeasNs = h.tMeasNs;
                 RecordNsDecision(cur.ver);
-                groundLog.push_back({1, share, cur.ver, Simulator::Now(), L::Host::Ground});
+                groundLog[s].push_back({1, share, cur.ver, Simulator::Now(), L::Host::Ground});
+            }
+            else
+            {
+                // Apply the merge (D5): when the authoritative write is the
+                // ground's and it differs from what the satellite holds, the
+                // reconciled value is sent back with the authority.
+                // Compare with the share the satellite reports holding (M4c).
+                const auto w = m.winner.find(1);
+                if (w != m.winner.end() && w->second == L::Host::Ground && m.state.count(1) &&
+                    std::fabs(h.v1 - m.state.at(1)) > 0.01)
+                {
+                    r.flags |= 1;
+                    r.seq = static_cast<uint32_t>(std::lround(m.state.at(1) * 1e6));
+                    r.tMeasNs = h.tMeasNs;
+                    ++st.mergeGroundApplied;
+                }
             }
             SendToSat(s, r, PayloadSize(RECON_ACK, 0));
             break;
@@ -1547,10 +2101,33 @@ SmoRecv(Ptr<Socket> sock)
 // ---------------------------------------------------------------------------
 // SMO: policy updates, A1 to the RIC, and (onboard strategy) to satellites
 // ---------------------------------------------------------------------------
+// Spacing of A1 intent versions (D8): Poisson (the lemma's assumption),
+// periodic with a random phase, or bursty (two-phase hyperexponential with
+// balanced means and squared coefficient of variation a1BurstCv2). All have
+// mean a1MeanS.
+Ptr<UniformRandomVariable> rvA1u;
+double
+NextA1Gap()
+{
+    if (g.a1Process == "periodic")
+    {
+        return g.a1MeanS;
+    }
+    if (g.a1Process == "bursty")
+    {
+        const double c2 = g.a1BurstCv2;
+        const double p1 = 0.5 * (1.0 + std::sqrt((c2 - 1.0) / (c2 + 1.0)));
+        const bool first = rvA1u->GetValue() < p1;
+        const double m = first ? g.a1MeanS / (2.0 * p1) : g.a1MeanS / (2.0 * (1.0 - p1));
+        return rvA1->GetValue() * m / g.a1MeanS;
+    }
+    return rvA1->GetValue();
+}
+
 void
 SmoIssue()
 {
-    Simulator::Schedule(Seconds(rvA1->GetValue()), &SmoIssue);
+    Simulator::Schedule(Seconds(NextA1Gap()), &SmoIssue);
     static const double gs[4] = {0.2, 0.3, 0.4, 0.5};
     static const double hs[3] = {0.1, 0.2, 0.3};
     Policy p;
@@ -1562,7 +2139,7 @@ SmoIssue()
     smoCur = p;
     verIssued[p.ver] = Simulator::Now().GetSeconds();
     smoMgr->UpdatePolicy(smoPolicyId, ToA1(p));
-    if (g.strat == Strategy::Onboard && servingIdx >= 0 && gview[servingIdx].e2)
+    if (IsOnboardLike() && servingIdx >= 0 && gview[servingIdx].e2)
     {
         // On-board only: the SMO pushes a new version at once (the retry loop
         // covers losses), as the RIC mirrors it in the hybrid strategies.
@@ -1571,6 +2148,7 @@ SmoIssue()
         a.ver = p.ver;
         a.v1 = p.g;
         a.v2 = p.h;
+        a.untilNs = OnbLeaseUntilNs();
         SendToSat(servingIdx, a, PayloadSize(A1_PUT, 0), true);
     }
 }
@@ -1601,7 +2179,7 @@ RicOnA1(A1NtnPolicy a)
         }
         else if (IsPal())
         {
-            PushPolicyToSat(s, true);
+            PushPolicyToSat(s, IsLeasing());
         }
     }
 }
@@ -1610,7 +2188,7 @@ void
 SmoRetryLoop()
 {
     Simulator::Schedule(Seconds(g.a1RetryS), &SmoRetryLoop);
-    if (g.strat != Strategy::Onboard || servingIdx < 0)
+    if (!IsOnboardLike() || servingIdx < 0)
     {
         return;
     }
@@ -1626,8 +2204,55 @@ SmoRetryLoop()
         a.ver = smoCur.ver;
         a.v1 = smoCur.g;
         a.v2 = smoCur.h;
+        a.untilNs = OnbLeaseUntilNs();
         SendToSat(s, a, PayloadSize(A1_PUT, 0), true);
     }
+}
+
+void
+EnterAutonomy(int s)
+{
+    Sat& sat = sats[s];
+    sat.autonomous = true;
+    // A satellite that already holds a lease has had authority since the
+    // grant: keep its log and start (M4a). Otherwise authority starts now.
+    bool leasedAny = false;
+    for (int c = 0; c < kClasses; ++c)
+    {
+        leasedAny = leasedAny || sat.leased[c];
+    }
+    if (!leasedAny)
+    {
+        sat.autonomyStart = Simulator::Now();
+        sat.log.clear();
+    }
+    ++st.autonomyEntries;
+    if (sat.linkUp)
+    {
+        ++st.falseAutonomy;
+    }
+}
+
+// onboard-ttl: the SMO refreshes the lease of the serving satellite's intent
+// at the heartbeat period with a small A1 message that names the current
+// version; the satellite renews only a snapshot of that version.
+void
+SmoLeaseRefreshLoop()
+{
+    Simulator::Schedule(Seconds(g.hbPeriodS), &SmoLeaseRefreshLoop);
+    const int s = servingIdx;
+    if (s < 0 || !gview[s].e2)
+    {
+        return;
+    }
+    MgmtHeader a;
+    a.type = A1_PUT;
+    a.flags = 2;
+    a.ver = smoCur.ver;
+    a.v1 = smoCur.g;
+    a.v2 = smoCur.h;
+    a.untilNs = OnbLeaseUntilNs();
+    SendToSat(s, a, PayloadSize(A1_ACK, 0), true);
 }
 
 void
@@ -1645,23 +2270,32 @@ HbLoop()
     {
         MgmtHeader h;
         h.type = HB;
+        h.ver = ricPolicy.ver;
         h.untilNs = IsLeasing() ? PredictedLeaseUntil(s).GetNanoSeconds() : 0;
         SendToSat(s, h, 0);
+    }
+    if (UsesPreprov() && IsLeasing())
+    {
+        // Provisioned successors are heartbeated too, so the lease of their
+        // snapshot is measured from the last contact (D16).
+        for (int n = 0; n < static_cast<int>(sats.size()); ++n)
+        {
+            if (n != s && gview[n].prepSent && gview[n].e2)
+            {
+                MgmtHeader h;
+                h.type = HB;
+                h.ver = ricPolicy.ver;
+                h.untilNs = PredictedLeaseUntil(n).GetNanoSeconds();
+                SendToSat(n, h, 0);
+            }
+        }
     }
     const Time to = Seconds(g.hbPeriodS * g.hbMiss);
     // Satellite side: no heartbeat for hbMiss periods -> autonomy. This holds
     // also for a satellite that has not completed E2 setup yet.
     if (sat.hbArmed && !sat.autonomous && Simulator::Now() - sat.lastHbRx > to)
     {
-        sat.autonomous = true;
-        sat.autonomyStart = Simulator::Now();
-        gv.leaseStart = sat.autonomyStart;
-        sat.log.clear();
-        ++st.autonomyEntries;
-        if (sat.linkUp)
-        {
-            ++st.falseAutonomy;
-        }
+        EnterAutonomy(s);
     }
     // Ground side mirror.
     if (gv.hbArmed && !gv.autonomous && Simulator::Now() - gv.lastHbAck > to)
@@ -1705,7 +2339,6 @@ PalTick()
     // Uses only what the RIC knows: its own E2 state and recent traffic.
     if (s >= 0 && gview[s].e2 && RicSeesUp(s))
     {
-        Sat& sat = sats[s];
         GroundView& gv = gview[s];
         const Time remain = PredLoss(s) - now;
         // RT placement check (logged): does the rule ever put RT on the ground?
@@ -1733,7 +2366,7 @@ PalTick()
             a.ver = ricPolicy.ver;
             a.v1 = ricPolicy.g;
             a.v2 = ricPolicy.h;
-            a.untilNs = PredictedLeaseUntil(s).GetNanoSeconds();
+            a.untilNs = IsLeasing() ? PredictedLeaseUntil(s).GetNanoSeconds() : 0;
             a.flags = 1 | grant;
             gv.leaseStart = now;
             for (int c = kNF; c < kClasses; ++c)
@@ -1750,35 +2383,73 @@ PalTick()
         else if (now - gv.lastRenew > Seconds(30))
         {
             gv.lastRenew = now;
-            PushPolicyToSat(s, true); // lease renewal while connected
+            PushPolicyToSat(s, IsLeasing()); // lease renewal while connected
         }
-        // Satellite side: a lease granted for a loss that did not come (the
-        // ephemeris error put the edge later) is returned after lead + 1 s.
-        bool held = false;
+    }
+}
+
+// Satellite-side timer, every 100 ms (D18): the return of a lease granted
+// for a loss that did not come uses only the satellite's own state.
+void
+SatTick()
+{
+    Simulator::Schedule(MilliSeconds(100), &SatTick);
+    const Time now = Simulator::Now();
+    const int s = servingIdx;
+    if (s >= 0 && g.strat == Strategy::SatPred)
+    {
+        // Satellite-side prediction (R3-M4): the satellite evaluates its own
+        // on-board contact plan (same ephemeris error as the RIC's plan) and
+        // takes the near-RT classes T_lead before the predicted loss, with
+        // no message from the ground. Same lead and the same return-after
+        // T_lead + 1 s rule as PAL, decided from on-board state only.
+        Sat& sat = sats[s];
+        if (sat.predAuto && sat.autonomous && sat.linkUp &&
+            now - sat.predAt > Seconds(g.leadS + 1.0))
+        {
+            SatResume(s); // the predicted loss did not come
+        }
+        else if (!sat.autonomous && sat.linkUp && sat.e2Setup && sat.hbArmed &&
+                 PredLoss(s) - now < Seconds(g.leadS))
+        {
+            sat.autonomous = true;
+            sat.predAuto = true;
+            sat.predAt = now;
+            sat.autonomyStart = now;
+            sat.log.clear();
+            ++st.satPredEntries;
+        }
+        return;
+    }
+    if (s < 0 || !IsPal() || GroundWinsReturn())
+    {
+        return;
+    }
+    Sat& sat = sats[s];
+    bool held = false;
+    for (int c = 0; c < kClasses; ++c)
+    {
+        held = held || sat.leased[c];
+    }
+    if (held && !sat.autonomous && now - sat.leaseGrantedAt > Seconds(g.leadS + 1.0))
+    {
+        sat.leaseGrantedAt = now + Seconds(3600); // one return attempt per grant
+        MgmtHeader r;
+        r.type = RECON;
         for (int c = 0; c < kClasses; ++c)
         {
-            held = held || sat.leased[c];
-        }
-        if (held && !sat.autonomous && now - sat.leaseGrantedAt > Seconds(g.leadS + 1.0) &&
-            g.strat != Strategy::PalGw)
-        {
-            sat.leaseGrantedAt = now + Seconds(3600); // one return attempt per grant
-            MgmtHeader r;
-            r.type = RECON;
-            for (int c = 0; c < kClasses; ++c)
+            if (sat.leased[c])
             {
-                if (sat.leased[c])
-                {
-                    r.flags |= (2u << c);
-                }
+                r.flags |= (2u << c);
             }
-            r.ver = sat.shareVer;
-            r.v1 = sat.share;
-            r.v2 = Demand();
-            r.tMeasNs = now.GetNanoSeconds();
-            reconSnap[s] = sat.log;
-            SendSatMsg(s, r, PayloadSize(RECON, static_cast<uint32_t>(sat.log.size())));
         }
+        r.ver = sat.shareVer;
+        r.v1 = sat.share;
+        r.v2 = Demand();
+        r.untilNs = sat.autonomyStart.GetNanoSeconds(); // t0 (M4b)
+        r.tMeasNs = now.GetNanoSeconds();
+        reconSnap[s] = sat.log;
+        SendSatMsg(s, r, PayloadSize(RECON, static_cast<uint32_t>(sat.log.size())));
     }
 }
 
@@ -1817,11 +2488,11 @@ OnFeederUp(int s)
 {
     Sat& sat = sats[s];
     FlushBuffer(s);
-    if (IsPal() && g.strat != Strategy::PalGw)
+    if (IsPal() && !GroundWinsReturn())
     {
         SatSendRecon(s);
     }
-    if (g.strat == Strategy::PalGw)
+    if (GroundWinsReturn())
     {
         // Ablation: ground-wins return. Leases are dropped at once and the
         // resume path of the reactive hybrid reconciles.
@@ -1839,7 +2510,7 @@ OnFeederUp(int s)
     }
     // Every hybrid reports at link-up, not at the next heartbeat, so the
     // return paths of all strategies start from the same trigger.
-    if ((IsReactiveLike() || g.strat == Strategy::PalGw) && sat.autonomous && sat.e2Setup)
+    if ((IsReactiveLike() || GroundWinsReturn()) && sat.autonomous && sat.e2Setup)
     {
         SatResume(s);
     }
@@ -1968,7 +2639,7 @@ EndOutage(int s, bool bySwitch)
         pendTtc.sat = s;
         pendTtc.restoreAt = o.end;
         pendTtc.outageIdx = curOutage;
-        if (g.strat == Strategy::Onboard)
+        if (IsOnboardLike())
         {
             CheckTtc(s, sats[s].shareVer, true); // already consistent if current
         }
@@ -2013,6 +2684,7 @@ TopoTick()
             ns.share = g.defaultShare;
             ns.shareVer = 0;
             ns.shareDefault = true;
+            ResetAppliedBeams(); // the new satellite has no beam applied yet
             ns.lastHbRx = now; // heartbeats start with the role
             ns.hbArmed = true;
             gview[servingIdx].lastHbAck = now;
@@ -2031,6 +2703,7 @@ TopoTick()
             ps.subscribed = {false, false, false};
             ps.leased = {false, false, false};
             ps.autonomous = false;
+            ps.predAuto = false;
             ps.hbArmed = false;
             ps.provisioned = false;
             ps.buf.clear();
@@ -2069,18 +2742,44 @@ TopoTick()
             }
         }
         const int gwBefore = sat.activeGw;
+        // Rel-17 soft (make-before-break) feeder-link switch-over (D11): a
+        // gateway change forced by geometry, with the next gateway already
+        // usable, costs no re-acquisition gap. A change forced by a fade is
+        // unplanned and stays a hard switch.
+        const bool soft = g.softSwitch && sat.linkUp && gwBefore >= 0 && want >= 0 &&
+                          want != gwBefore && !PairVisible(sat, gwBefore, now) &&
+                          !RainAt(gwBefore, t);
         if (want != sat.activeGw)
         {
             if (sat.activeGw >= 0)
             {
-                SetPairUp(sat, sat.activeGw, false);
+                if (soft)
+                {
+                    const int old = sat.activeGw;
+                    const size_t kk = k;
+                    Simulator::Schedule(MilliSeconds(50), [kk, old]() {
+                        if (sats[kk].activeGw != old)
+                        {
+                            SetPairUp(sats[kk], old, false);
+                        }
+                    });
+                }
+                else
+                {
+                    SetPairUp(sat, sat.activeGw, false);
+                }
             }
             sat.activeGw = want;
             if (want >= 0)
             {
                 sat.lastGw = want;
-                sat.acqUntil = now + Seconds(g.acqS);
+                sat.acqUntil = soft ? now : now + Seconds(g.acqS);
                 SetSatDefaultRoute(sat, want);
+                if (soft)
+                {
+                    SetPairUp(sat, want, true);
+                    ++softSwitches;
+                }
             }
         }
         const bool up = sat.activeGw >= 0 && now >= sat.acqUntil;
@@ -2093,6 +2792,21 @@ TopoTick()
                 if (!up)
                 {
                     StartOutage(static_cast<int>(k), gwBefore);
+                    if (g.linkDetectS >= 0 && (IsReactiveLike() || IsPal()))
+                    {
+                        // Link-layer loss of carrier (D12): the satellite
+                        // knows a gateway change it commands at once, and any
+                        // other loss of lock after linkDetectS.
+                        const bool commanded = gwBefore >= 0 && want >= 0 && want != gwBefore;
+                        const int kk = static_cast<int>(k);
+                        Simulator::Schedule(Seconds(commanded ? 0.0 : g.linkDetectS), [kk]() {
+                            Sat& x = sats[kk];
+                            if (IsServing(kk) && !x.linkUp && !x.autonomous && x.hbArmed)
+                            {
+                                EnterAutonomy(kk);
+                            }
+                        });
+                    }
                 }
                 else
                 {
@@ -2144,11 +2858,14 @@ SlaTick()
                     : sat.shareVer < smoCur.ver ? 2 : 3;
     ++catSamp[cat];
     catOver[cat] += std::max(0.0, a - r);
+    catShort[cat] += std::max(0.0, r - a);
+    st.shortSum += std::max(0.0, r - a);
     if (a < r - 0.01)
     {
         ++st.slaViol;
         ++violBy[lu][vc];
         ++catViol[cat];
+        st.shortSumViol += r - a;
     }
     st.overSum += std::max(0.0, a - r);
 }
@@ -2199,6 +2916,394 @@ Mean(const std::vector<float>& v)
     return s / v.size();
 }
 
+
+
+// ---------------------------------------------------------------------------
+// Wave 7B: measured user plane over the same orbits and feeder state
+// ---------------------------------------------------------------------------
+
+constexpr double kCLight = 299792458.0;
+
+double
+UpDist(Ptr<MobilityModel> a, Ptr<MobilityModel> b)
+{
+    return CalculateDistance(a->GetPosition(), b->GetPosition());
+}
+
+struct UpPlane
+{
+    uint32_t numUes{4};
+    NodeContainer ues;
+    std::vector<Ptr<NtnTr38811MobilityModel>> ueMob;
+    std::vector<Ptr<Node>> sat; //!< user-plane node per sats[] index
+    std::vector<Ptr<Node>> gw;
+    std::vector<Ptr<MobilityModel>> gwMob;
+    Ptr<Node> upf;
+    // service link [u][k]: UE-side interface, satellite-side address, channel, gate
+    std::vector<std::vector<uint32_t>> ueIf;
+    std::vector<std::vector<Ipv4Address>> satAddrSvc;
+    std::vector<std::vector<Ptr<PointToPointChannel>>> svcCh;
+    std::vector<std::vector<Ptr<OranNtnGatedErrorModel>>> svcGate;
+    // feeder [k][j]
+    std::vector<std::vector<uint32_t>> satIfFeeder;
+    std::vector<std::vector<Ipv4Address>> gwAddrFeeder;
+    std::vector<std::vector<Ptr<PointToPointChannel>>> fdrCh;
+    std::vector<std::vector<Ptr<OranNtnGatedErrorModel>>> fdrGate;
+    std::vector<int> routedGw; //!< per satellite
+    int routedServing{-2};
+    std::vector<Ptr<NtnOranApplication>> apps;
+    std::vector<Ptr<NtnOranSink>> sinks;
+    Ptr<NtnOranAiFlowMonitor> kpm;
+    Ptr<FlowMonitor> fm;
+    FlowMonitorHelper fmh;
+    uint64_t ticks{0};
+    double propSumMs{0};
+    double bhSumMs{0};
+    std::vector<double> bhMs;
+    uint64_t propN{0};
+    uint64_t txDuringOutage{0};
+    uint64_t txTotal{0};
+};
+
+UpPlane up;
+
+void
+UpRouteDefault(Ptr<Node> n, Ipv4Address nh, uint32_t ifIndex)
+{
+    Ipv4StaticRoutingHelper h;
+    Ptr<Ipv4StaticRouting> sr = h.GetStaticRouting(n->GetObject<Ipv4>());
+    for (uint32_t i = sr->GetNRoutes(); i-- > 0;)
+    {
+        if (sr->GetRoute(i).IsDefault())
+        {
+            sr->RemoveRoute(i);
+        }
+    }
+    sr->SetDefaultRoute(nh, ifIndex);
+}
+
+/// Every 20 ms: follow the serving satellite and its active gateway; every
+/// 100 ms: link delays from the live SGP4 / TR 38.811 geometry.
+void
+UpTick()
+{
+    Simulator::Schedule(MilliSeconds(20), &UpTick);
+    if (servingIdx != up.routedServing && servingIdx >= 0)
+    {
+        for (uint32_t u = 0; u < up.numUes; ++u)
+        {
+            UpRouteDefault(up.ues.Get(u), up.satAddrSvc[u][servingIdx], up.ueIf[u][servingIdx]);
+        }
+        up.routedServing = servingIdx;
+    }
+    for (size_t k = 0; k < sats.size(); ++k)
+    {
+        const int a = sats[k].activeGw;
+        if (a >= 0 && a != up.routedGw[k])
+        {
+            UpRouteDefault(up.sat[k], up.gwAddrFeeder[k][a], up.satIfFeeder[k][a]);
+            up.routedGw[k] = a;
+        }
+    }
+    if (up.ticks++ % 5 != 0)
+    {
+        return;
+    }
+    for (size_t k = 0; k < sats.size(); ++k)
+    {
+        for (uint32_t u = 0; u < up.numUes; ++u)
+        {
+            up.svcCh[u][k]->SetAttribute(
+                "Delay", TimeValue(Seconds(UpDist(sats[k].mob, up.ueMob[u]) / kCLight)));
+        }
+        for (uint32_t j = 0; j < g.numGw; ++j)
+        {
+            up.fdrCh[k][j]->SetAttribute(
+                "Delay", TimeValue(Seconds(UpDist(sats[k].mob, up.gwMob[j]) / kCLight)));
+        }
+    }
+    if (servingIdx >= 0 && sats[servingIdx].activeGw >= 0)
+    {
+        const Sat& s = sats[servingIdx];
+        up.bhSumMs += up.bhMs[s.activeGw];
+        up.propSumMs += (UpDist(s.mob, up.ueMob[0]) +
+                         UpDist(s.mob, up.gwMob[s.activeGw])) /
+                        kCLight * 1e3;
+        ++up.propN;
+    }
+}
+
+/// Build the user plane (after the control plane; see the file comment).
+void
+BuildUserPlane(const std::vector<double>& upfBackhaulS)
+{
+    InternetStackHelper inet;
+    const size_t nSat = sats.size();
+    up.ues.Create(up.numUes);
+    inet.Install(up.ues);
+    NtnTr38811MobilityHelper ueMob(g.run);
+    up.ueMob = ueMob.Install(up.ues, NtnMobilityScenarios::Maritime(), g.cellLat - 0.05,
+                             g.cellLat + 0.05, g.cellLon - 0.05, g.cellLon + 0.05);
+    up.upf = CreateObject<Node>();
+    inet.Install(up.upf);
+    for (size_t k = 0; k < nSat; ++k)
+    {
+        up.sat.push_back(CreateObject<Node>());
+        inet.Install(up.sat.back());
+    }
+    Ipv4AddressHelper ah;
+    Ipv4StaticRoutingHelper srh;
+    Ipv4Address upfAddr;
+    for (uint32_t j = 0; j < g.numGw; ++j)
+    {
+        up.gw.push_back(CreateObject<Node>());
+        inet.Install(up.gw.back());
+        auto gm = CreateObject<ConstantPositionMobilityModel>();
+        gm->SetPosition(OranNtnContactPlan::GeodeticToEcef(kGw[j].lat, kGw[j].lon, 0.0));
+        up.gwMob.push_back(gm);
+        PointToPointHelper bh;
+        bh.SetDeviceAttribute("DataRate", StringValue("1Gbps"));
+        bh.SetChannelAttribute("Delay", TimeValue(Seconds(upfBackhaulS[j])));
+        up.bhMs.push_back(upfBackhaulS[j] * 1e3);
+        NetDeviceContainer d = bh.Install(up.gw.back(), up.upf);
+        char base[32];
+        std::snprintf(base, sizeof(base), "172.40.%u.0", j);
+        ah.SetBase(base, "255.255.255.252");
+        Ipv4InterfaceContainer ii = ah.Assign(d);
+        if (j == 0)
+        {
+            upfAddr = ii.GetAddress(1);
+        }
+        UpRouteDefault(up.gw.back(), ii.GetAddress(1),
+                       up.gw.back()->GetObject<Ipv4>()->GetInterfaceForDevice(d.Get(0)));
+    }
+    // Feeders, satellite -> gateway direction measured at the gateway.
+    up.satIfFeeder.assign(nSat, {});
+    up.gwAddrFeeder.assign(nSat, {});
+    up.fdrCh.assign(nSat, {});
+    up.fdrGate.assign(nSat, {});
+    up.routedGw.assign(nSat, -1);
+    for (size_t k = 0; k < nSat; ++k)
+    {
+        for (uint32_t j = 0; j < g.numGw; ++j)
+        {
+            PointToPointHelper fl;
+            fl.SetDeviceAttribute("DataRate", StringValue("50Mbps"));
+            fl.SetChannelAttribute("Delay", TimeValue(Seconds(
+                                                UpDist(sats[k].mob, up.gwMob[j]) / kCLight)));
+            NetDeviceContainer d = fl.Install(up.sat[k], up.gw[j]);
+            char base[32];
+            std::snprintf(base, sizeof(base), "172.%u.%zu.%zu", 32 + j, k / 64, (k % 64) * 4);
+            ah.SetBase(base, "255.255.255.252");
+            Ipv4InterfaceContainer ii = ah.Assign(d);
+            up.satIfFeeder[k].push_back(up.sat[k]->GetObject<Ipv4>()->GetInterfaceForDevice(d.Get(0)));
+            up.gwAddrFeeder[k].push_back(ii.GetAddress(1));
+            up.fdrCh[k].push_back(DynamicCast<PointToPointChannel>(d.Get(0)->GetChannel()));
+            auto ka = CreateObject<ntncon::NtnSatLinkErrorModel>();
+            ka->SetEndpoints(sats[k].mob, up.gwMob[j]);
+            ka->SetAttribute("CarrierHz", DoubleValue(19.7e9));
+            ka->SetAttribute("EirpDbw", DoubleValue(50.0));
+            ka->SetAttribute("RxGtDbK", DoubleValue(35.0));
+            ka->SetAttribute("BandwidthHz", DoubleValue(250e6));
+            ka->SetAttribute("EnableRain", BooleanValue(false));
+            ka->SetAttribute("StationLatitudeDeg", DoubleValue(kGw[j].lat));
+            auto gate = CreateObject<OranNtnGatedErrorModel>();
+            gate->SetGate(OranNtnGatedErrorModel::MirrorOutage(sats[k].emGw[j]));
+            gate->SetInner(ka);
+            d.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(gate));
+            up.fdrGate[k].push_back(gate);
+        }
+    }
+    // Service links, UE -> satellite direction measured at the satellite.
+    up.ueIf.assign(up.numUes, {});
+    up.satAddrSvc.assign(up.numUes, {});
+    up.svcCh.assign(up.numUes, {});
+    up.svcGate.assign(up.numUes, {});
+    for (uint32_t u = 0; u < up.numUes; ++u)
+    {
+        for (size_t k = 0; k < nSat; ++k)
+        {
+            PointToPointHelper sl;
+            sl.SetDeviceAttribute("DataRate", StringValue("1Mbps"));
+            sl.SetChannelAttribute("Delay", TimeValue(Seconds(
+                                                UpDist(sats[k].mob, up.ueMob[u]) / kCLight)));
+            NetDeviceContainer d = sl.Install(up.ues.Get(u), up.sat[k]);
+            char base[32];
+            std::snprintf(base, sizeof(base), "172.%u.%zu.%zu", 16 + u, k / 64, (k % 64) * 4);
+            ah.SetBase(base, "255.255.255.252");
+            Ipv4InterfaceContainer ii = ah.Assign(d);
+            up.ueIf[u].push_back(up.ues.Get(u)->GetObject<Ipv4>()->GetInterfaceForDevice(d.Get(0)));
+            up.satAddrSvc[u].push_back(ii.GetAddress(1));
+            up.svcCh[u].push_back(DynamicCast<PointToPointChannel>(d.Get(0)->GetChannel()));
+            auto sb = CreateObject<ntncon::NtnSatLinkErrorModel>();
+            sb->SetEndpoints(up.ueMob[u], sats[k].mob);
+            sb->SetAttribute("CarrierHz", DoubleValue(1.995e9));
+            sb->SetAttribute("EirpDbw", DoubleValue(-7.0));
+            sb->SetAttribute("RxGtDbK", DoubleValue(1.1));
+            sb->SetAttribute("BandwidthHz", DoubleValue(360e3));
+            sb->SetAttribute("EnableRain", BooleanValue(false));
+            sb->SetAttribute("StationLatitudeDeg", DoubleValue(g.cellLat));
+            auto gate = CreateObject<OranNtnGatedErrorModel>();
+            const int kk = static_cast<int>(k);
+            gate->SetGate([kk]() { return servingIdx != kk; });
+            gate->SetInner(sb);
+            d.Get(1)->SetAttribute("ReceiveErrorModel", PointerValue(gate));
+            up.svcGate[u].push_back(gate);
+        }
+    }
+    // Apps: voice on even UEs, mMTC telemetry on odd UEs; one sink port each.
+    up.kpm = CreateObject<NtnOranAiFlowMonitor>();
+    for (uint32_t u = 0; u < up.numUes; ++u)
+    {
+        const uint16_t port = static_cast<uint16_t>(9100 + u);
+        Ptr<NtnOranSink> sink = CreateObject<NtnOranSink>();
+        sink->SetAttribute("Local", AddressValue(InetSocketAddress(Ipv4Address::GetAny(), port)));
+        up.upf->AddApplication(sink);
+        sink->SetStartTime(Seconds(0.0));
+        Ptr<NtnOranApplication> app = CreateObject<NtnOranApplication>();
+        app->SetRemote(InetSocketAddress(upfAddr, port));
+        const bool voice = (u % 2) == 0;
+        app->SetProfile(voice ? NtnOranApplication::CONVERSATIONAL_VOICE
+                              : NtnOranApplication::MMTC_PERIODIC);
+        // AMR-WB frame + RTP (92 B, as NtnRealStackHelper's voice flow) and a
+        // 128 B telemetry reading (its NB-IoT flow); the 1400 B default would
+        // be a video frame.
+        app->SetAttribute("PacketSize", UintegerValue(voice ? 92 : 128));
+        app->SetFlowIdentity(voice ? 1 : 9, voice ? 1 : 3, 0x000001, static_cast<uint16_t>(u + 1),
+                             1000);
+        up.ues.Get(u)->AddApplication(app);
+        app->SetStartTime(Seconds(1.0 + 0.001 * u));
+        app->SetStopTime(Seconds(g.simS - 1.0));
+        up.apps.push_back(app);
+        up.sinks.push_back(sink);
+        up.kpm->AddSource(app);
+        // UPF-side sinks of uplink flows (no PHY source on this monitor): name
+        // them explicitly so the KPMs carry the TS 28.552 UL names
+        // (DRB.UEThpUl, DRB.PdcpSduVolumeUl, DRB.RlcDelayUl, DRB.PacketLossRateUl).
+        up.kpm->AddSink(sink, static_cast<int32_t>(u), NtnOranAiFlowMonitor::Direction::Uplink);
+    }
+    up.kpm->Start();
+    NodeContainer all(up.ues);
+    all.Add(up.upf);
+    for (auto& n : up.sat)
+    {
+        all.Add(n);
+    }
+    for (auto& n : up.gw)
+    {
+        all.Add(n);
+    }
+    up.fm = up.fmh.Install(all);
+    Simulator::Schedule(MilliSeconds(1), &UpTick);
+}
+
+/// Count the user-plane packets offered while the serving feeder is down.
+void
+UpOutageSampler()
+{
+    Simulator::Schedule(MilliSeconds(20), &UpOutageSampler);
+    if (servingIdx < 0)
+    {
+        return;
+    }
+    const Sat& s = sats[servingIdx];
+    const bool down = s.activeGw < 0 || s.emGw[s.activeGw]->GetRate() >= 1.0;
+    up.txTotal += 1;
+    up.txDuringOutage += down ? 1 : 0;
+}
+
+void
+WriteUserPlane()
+{
+    up.fm->CheckForLostPackets();
+    auto cls = DynamicCast<Ipv4FlowClassifier>(up.fmh.GetClassifier());
+    uint64_t fmTx = 0;
+    uint64_t fmRx = 0;
+    double jitterSum = 0.0;
+    uint64_t jitterN = 0;
+    double fmDelaySumMs = 0.0;
+    for (const auto& [id, fs] : up.fm->GetFlowStats())
+    {
+        fmTx += fs.txPackets;
+        fmRx += fs.rxPackets;
+        fmDelaySumMs += fs.delaySum.GetSeconds() * 1e3;
+        if (fs.rxPackets > 1)
+        {
+            jitterSum += fs.jitterSum.GetSeconds() * 1e3;
+            jitterN += fs.rxPackets - 1;
+        }
+    }
+    up.fm->SerializeToXmlFile(g.outDir + "/up_flowmon.xml", false, false);
+    up.kpm->WriteCsv(g.outDir + "/up_kpm_series.csv");
+    uint64_t svcGated = 0;
+    uint64_t svcLink = 0;
+    uint64_t svcPass = 0;
+    uint64_t fdrGated = 0;
+    uint64_t fdrLink = 0;
+    for (const auto& row : up.svcGate)
+    {
+        for (const auto& gte : row)
+        {
+            svcGated += gte->GetGatedDrops();
+            svcLink += gte->GetInnerDrops();
+            svcPass += gte->GetPassed();
+        }
+    }
+    for (const auto& row : up.fdrGate)
+    {
+        for (const auto& gte : row)
+        {
+            fdrGated += gte->GetGatedDrops();
+            fdrLink += gte->GetInnerDrops();
+        }
+    }
+    std::ofstream f(g.outDir + "/up_flows.csv");
+    f << "ue,class,five_qi,tx,rx,loss_ratio,owd_mean_ms,jitter_ms\n";
+    auto lp = CreateObject<ntnobs::NtnInfluxSink>();
+    lp->SetTransport(ntnobs::NtnInfluxSink::Transport::File);
+    lp->SetFilePath(g.outDir + "/up.lp");
+    lp->SetBaseEpoch(Time(0));
+    uint64_t tx = 0;
+    uint64_t rx = 0;
+    double owdW = 0.0;
+    for (uint32_t u = 0; u < up.numUes; ++u)
+    {
+        const bool voice = (u % 2) == 0;
+        const uint64_t t = up.apps[u]->GetTxPackets();
+        const uint64_t r = up.sinks[u]->GetRxPackets();
+        tx += t;
+        rx += r;
+        owdW += up.sinks[u]->GetMeanDelayMs() * r;
+        f << u << "," << up.ueMob[u]->GetClassName() << "," << (voice ? 1 : 9) << "," << t << ","
+          << r << "," << (t ? 1.0 - double(r) / t : 0.0) << "," << up.sinks[u]->GetMeanDelayMs()
+          << "," << up.sinks[u]->GetMeanJitterMs() << "\n";
+        ntnobs::Point p;
+        p.measurement = "feeder_mgmt_user_plane";
+        p.tags["ue"] = std::to_string(u);
+        p.tags["five_qi"] = voice ? "1" : "9";
+        p.fieldsInt["tx"] = static_cast<long long>(t);
+        p.fieldsInt["rx"] = static_cast<long long>(r);
+        p.fieldsFloat["owd_ms"] = up.sinks[u]->GetMeanDelayMs();
+        p.fieldsFloat["jitter_ms"] = up.sinks[u]->GetMeanJitterMs();
+        p.timestamp = Simulator::Now();
+        lp->Push(p);
+    }
+    lp->Flush();
+    const double outageShare = up.txTotal ? double(up.txDuringOutage) / up.txTotal : 0.0;
+    std::printf("# user plane: %u TR 38.811 UEs (maritime mix), sent %lu received %lu (loss %.4f; "
+                "FlowMonitor %lu/%lu, IP delay %.2f ms), owd mean %.2f ms vs propagation mean "
+                "%.2f ms + gateway-UPF fibre mean %.2f ms, jitter %.3f ms; drops: service not serving %lu, service link %lu, feeder down %lu, "
+                "feeder link %lu; serving feeder down %.4f of the time\n",
+                up.numUes, (unsigned long)tx, (unsigned long)rx, tx ? 1.0 - double(rx) / tx : 0.0,
+                (unsigned long)fmRx, (unsigned long)fmTx, fmRx ? fmDelaySumMs / fmRx : 0.0,
+                rx ? owdW / rx : 0.0, up.propN ? up.propSumMs / up.propN : 0.0,
+                up.propN ? up.bhSumMs / up.propN : 0.0, jitterN ? jitterSum / jitterN : 0.0,
+                (unsigned long)svcGated, (unsigned long)svcLink, (unsigned long)fdrGated,
+                (unsigned long)fdrLink, outageShare);
+    (void)svcPass;
+    (void)cls;
+}
+
 } // namespace
 
 int
@@ -2206,7 +3311,10 @@ main(int argc, char* argv[])
 {
     std::string strat = "pal";
     CommandLine cmd(__FILE__);
-    cmd.AddValue("strategy", "ground|onboard|reactive|reactive-ttl|pal|pal-nopre|pal-gw", strat);
+    cmd.AddValue("strategy",
+                 "ground|onboard|onboard-ttl|reactive|reactive-ttl|reactive-ttl-pre|pal|pal-nopre|pal-gw|sat-pred|"
+                 "pred-ho|ground-pre",
+                 strat);
     cmd.AddValue("simSeconds", "simulated time (s)", g.simS);
     cmd.AddValue("shell", "550 (Walker-Delta 1584/72/1, 53 deg) or 1200 (Walker-Star 648/18, 87.9 deg)", g.shell);
     cmd.AddValue("numGw", "number of gateways (1-4)", g.numGw);
@@ -2228,9 +3336,21 @@ main(int argc, char* argv[])
     cmd.AddValue("a1MeanS", "mean time between A1 policy updates (s)", g.a1MeanS);
     cmd.AddValue("a1RetryS", "SMO A1 retry period, onboard strategy (s)", g.a1RetryS);
     cmd.AddValue("procScaleOnboard", "scale factor on on-board processing times", g.procScaleOnboard);
+    cmd.AddValue("softSwitch", "Rel-17 soft feeder-link switch-over on geometric gateway changes", g.softSwitch);
+    cmd.AddValue("linkDetectS", "link-layer loss-of-carrier detection delay (s); <0 off", g.linkDetectS);
+    cmd.AddValue("arqRtoS", "SCTP-like retransmission timeout for KPM/control (s); 0 off", g.arqRtoS);
+    cmd.AddValue("arqMax", "maximum retransmissions per datagram", g.arqMax);
+    cmd.AddValue("a1Process", "A1 update process: poisson|periodic|bursty", g.a1Process);
+    cmd.AddValue("a1BurstCv2", "squared CV of the bursty update process", g.a1BurstCv2);
+    cmd.AddValue("nfAccGround", "decision accuracy of the ground (full) NF xApp", g.nfAccGround);
+    cmd.AddValue("safeG", "guaranteed share of the safe intent", g.safeG);
+    cmd.AddValue("safeH", "headroom of the safe intent", g.safeH);
     cmd.AddValue("outputDir", "output directory", g.outDir);
     cmd.AddValue("run", "RNG run (seed index)", g.run);
+    cmd.AddValue("upUes", "measured user plane: TR 38.811 maritime UEs (0 = off, max 16)",
+                 up.numUes);
     cmd.Parse(argc, argv);
+    NS_ABORT_MSG_IF(up.numUes > 16, "upUes must be 0..16");
     g.stratName = strat;
     if (strat == "ground")
         g.strat = Strategy::Ground;
@@ -2248,6 +3368,14 @@ main(int argc, char* argv[])
         g.strat = Strategy::PalNoPre;
     else if (strat == "pal-gw")
         g.strat = Strategy::PalGw;
+    else if (strat == "onboard-ttl")
+        g.strat = Strategy::OnboardTtl;
+    else if (strat == "sat-pred")
+        g.strat = Strategy::SatPred;
+    else if (strat == "pred-ho")
+        g.strat = Strategy::PredHo;
+    else if (strat == "ground-pre")
+        g.strat = Strategy::GroundPre;
     else
         NS_ABORT_MSG("unknown strategy " << strat);
     NS_ABORT_MSG_IF(g.numGw < 1 || g.numGw > 4, "numGw must be 1..4");
@@ -2277,6 +3405,12 @@ main(int argc, char* argv[])
     rvArr->SetStream(11);
     rvHold->SetStream(12);
     rvA1->SetStream(13);
+    rvA1u = CreateObject<UniformRandomVariable>();
+    rvA1u->SetStream(16);
+    rvBeam = CreateObject<UniformRandomVariable>();
+    rvBeam->SetStream(17); // beam processes: identical for every strategy of a seed
+    rvDec = CreateObject<UniformRandomVariable>();
+    rvDec->SetStream(18);
 
     // ---- Constellation ----------------------------------------------------
     const double epoch = 1767225600.0 + rvScen->GetValue(0.0, 86400.0); // 2026-01-01 + U(0,1 d)
@@ -2309,7 +3443,7 @@ main(int argc, char* argv[])
     for (size_t i = 0; i < el.size(); ++i)
     {
         allMob[i] = CreateObject<ntncon::Sgp4MobilityModel>();
-        allMob[i]->SetElements(el[i]);
+        allMob[i]->SetElementsSgp4(el[i]);
     }
     const Vector cell = OranNtnContactPlan::GeodeticToEcef(g.cellLat, g.cellLon, 0.0);
 
@@ -2567,9 +3701,32 @@ main(int argc, char* argv[])
     smoPolicyId = smoMgr->CreatePolicy(ToA1(smoCur));
     ricA1->HandleIncomingPolicy(ToA1(smoCur)); // initial provisioning
     ricPolicy = smoCur;
-    for (auto& s : sats)
+    // Launch-time configuration: every satellite holds version 1. Under the
+    // leasing strategies that copy carries the same lease as every other
+    // snapshot, counted from configuration at t = 0, so a satellite that is
+    // never reached falls back to the safe intent after tau* (D2); without a
+    // lease it is held forever, the A1 default.
+    for (size_t k = 0; k < sats.size(); ++k)
     {
-        s.a1->HandleIncomingPolicy(ToA1(smoCur));
+        Policy p0 = smoCur;
+        p0.until = IsLeasing() ? LeaseTau() : Seconds(0);
+        sats[k].snap = p0;
+        sats[k].leaseTauS = IsLeasing() ? LeaseTau().GetSeconds() : 0.0;
+        sats[k].a1->HandleIncomingPolicy(ToA1(p0));
+    }
+    ResetAppliedBeams();
+
+    // ---- Measured user plane (Wave 7B) --------------------------------------
+    if (up.numUes > 0)
+    {
+        std::vector<double> bhS;
+        for (uint32_t j = 0; j < g.numGw; ++j)
+        {
+            const Vector gp = OranNtnContactPlan::GeodeticToEcef(kGw[j].lat, kGw[j].lon, 0.0);
+            bhS.push_back(0.002 + 1.5 * CalculateDistance(gp, ricPos) / 2e8);
+        }
+        BuildUserPlane(bhS);
+        Simulator::Schedule(MilliSeconds(3), &UpOutageSampler);
     }
 
     // ---- Health check: contact-plan geometry agrees with the propagator ----
@@ -2624,11 +3781,20 @@ main(int argc, char* argv[])
             });
         }
     }
-    Simulator::Schedule(Seconds(rvA1->GetValue()), &SmoIssue);
-    if (g.strat == Strategy::Onboard)
+    NS_ABORT_MSG_IF(g.a1Process != "poisson" && g.a1Process != "periodic" && g.a1Process != "bursty",
+                    "a1Process must be poisson, periodic or bursty");
+    Simulator::Schedule(Seconds(g.a1Process == "periodic" ? rvA1u->GetValue(0.0, g.a1MeanS) : NextA1Gap()),
+                        &SmoIssue);
+    if (IsOnboardLike())
     {
         Simulator::Schedule(Seconds(g.a1RetryS), &SmoRetryLoop);
     }
+    Simulator::Schedule(Seconds(0.1), &SatTick);
+    if (g.strat == Strategy::OnboardTtl)
+    {
+        Simulator::Schedule(Seconds(0.45), &SmoLeaseRefreshLoop);
+    }
+    Simulator::Schedule(MilliSeconds(5), &BeamTick);
     if (UsesHeartbeat())
     {
         Simulator::Schedule(Seconds(0.5), &HbLoop);
@@ -2671,7 +3837,19 @@ main(int argc, char* argv[])
              "ttc_p95_s,ttc_n,blackout_mean_s,blackout_p95_s,blackout_n,sig_bytes_per_switch,"
              "sig_msgs_per_switch,preprov_frac,feeder_bytes,feeder_kbps,autonomy_entries,"
              "false_autonomy,leases,kpm_delivered,kpm_discarded,ctrl_lost,kpm_codec_fail,fallback_frac,"
-             "hb_kbps,lease_kbps,e2setup_kbps,kpm_kbps,ctrl_kbps,a1_kbps,recon_kbps,lease_tau_s\n";
+             "hb_kbps,lease_kbps,e2setup_kbps,kpm_kbps,ctrl_kbps,a1_kbps,recon_kbps,lease_tau_s,merge_ground_applied,"
+             "nf_onb_decisions,ns_onb_decisions,arq_retx,arq_dup,arq_kbps,soft_switches,beam_samples";
+        for (int i = 0; i < kNT; ++i)
+        {
+            for (int j = 0; j < kNG; ++j)
+            {
+                char nm[64];
+                std::snprintf(nm, sizeof(nm), ",beam_mis_T%g_d%g", kDwell[i], kGap[j]);
+                f << nm;
+            }
+        }
+        f << ",short_depth_mean,short_depth_cond,sat_pred_entries";
+        f << "\n";
         uint32_t closed = 0;
         std::vector<float> ttc, conf, pconf, bo;
         for (const auto& o : st.outages)
@@ -2688,20 +3866,26 @@ main(int argc, char* argv[])
             }
         }
         double sigB = 0, sigM = 0, pre = 0;
+        size_t realSw = 0;
         for (const auto& s : st.switches)
         {
+            if (s.t < 1.0)
+            {
+                continue; // the initial attach is not a switch (D1, D29)
+            }
             if (s.blackoutNf >= 0)
             {
                 bo.push_back(s.blackoutNf);
             }
+            ++realSw;
             sigB += s.sigBytes;
             sigM += s.sigMsgs;
             pre += s.preProvisioned ? 1 : 0;
         }
-        const double nsw = std::max<size_t>(1, st.switches.size());
+        const double nsw = std::max<size_t>(1, realSw);
         f << g.stratName << "," << g.shell << "," << g.numGw << "," << g.run << "," << st.servedS
           << "," << (st.servedS > 0 ? st.linkUpServedS / st.servedS : 0) << "," << maxElErr << ","
-          << sats.size() << "," << st.switches.size() << "," << st.outages.size() << "," << closed;
+          << sats.size() << "," << realSw << "," << st.outages.size() << "," << closed;
         for (int c = 0; c < kClasses; ++c)
         {
             f << "," << st.opp[c] << "," << st.hit[c] << "," << st.applied[c] << "," << st.late[c]
@@ -2734,16 +3918,28 @@ main(int argc, char* argv[])
         f << "," << kbps({HB, HB_ACK}) << "," << kbps({LEASE, PREP}) << ","
           << kbps({E2_SETUP_REQ, E2_SETUP_RSP, SUB_REQ, SUB_RSP}) << "," << kbps({KPM_IND}) << ","
           << kbps({RC_CTRL}) << "," << kbps({A1_PUT, A1_ACK}) << "," << kbps({RECON, RECON_ACK})
-          << "," << LeaseTau().GetSeconds() << "\n";
+          << "," << LeaseTau().GetSeconds() << "," << st.mergeGroundApplied << ","
+          << st.nfOnbDecisions << "," << st.nsOnbDecisions << "," << st.arqRetx << "," << st.arqDup
+          << "," << kbps({ARQ_ACK}) << "," << softSwitches << "," << beamSamp;
+        for (int i = 0; i < kNT; ++i)
+        {
+            for (int j = 0; j < kNG; ++j)
+            {
+                f << "," << (beamSamp ? double(beamMis[i][j]) / beamSamp : 0.0);
+            }
+        }
+        f << "," << (st.slaSamples ? st.shortSum / st.slaSamples : 0) << ","
+          << (st.slaViol ? st.shortSumViol / st.slaViol : 0) << "," << st.satPredEntries;
+        f << "\n";
     }
     {
         std::ofstream f(g.outDir + "/outages.csv");
-        f << "start,end,dur,predicted,ended_by_switch,direct_conflicts,policy_stale,ttc,kind\n";
+        f << "start,end,dur,predicted,ended_by_switch,direct_conflicts,policy_stale,ttc,kind,fallback\n";
         for (const auto& o : st.outages)
         {
             f << o.start << "," << o.end << "," << (o.end - o.start) << "," << o.predicted << ","
               << o.endedBySwitch << "," << o.direct << "," << o.policyStale << "," << o.ttc
-              << "," << o.kind << "\n";
+              << "," << o.kind << "," << o.fallback << "\n";
         }
     }
     {
@@ -2795,13 +3991,18 @@ main(int argc, char* argv[])
         f << "rt_ticks,rt_ground_feasible_ticks,samp_down_stale,samp_down_cur,samp_up_stale,samp_up_cur,"
              "viol_down_stale,viol_down_cur,viol_up_stale,viol_up_cur,"
              "samp_default,viol_default,over_default,samp_fallback,viol_fallback,over_fallback,"
-             "samp_stale,viol_stale,over_stale,samp_current,viol_current,over_current\n"
+             "samp_stale,viol_stale,over_stale,samp_current,viol_current,over_current,"
+             "short_default,short_fallback,short_stale,short_current\n"
           << rtTicks << "," << rtGroundFeasibleTicks << "," << sampBy[0][0] << "," << sampBy[0][1] << ","
           << sampBy[1][0] << "," << sampBy[1][1] << "," << violBy[0][0] << "," << violBy[0][1] << ","
           << violBy[1][0] << "," << violBy[1][1];
         for (int k = 0; k < 4; ++k)
         {
             f << "," << catSamp[k] << "," << catViol[k] << "," << catOver[k];
+        }
+        for (int k = 0; k < 4; ++k)
+        {
+            f << "," << catShort[k];
         }
         f << "\n";
     }
@@ -2816,6 +4017,10 @@ main(int argc, char* argv[])
                 st.opp[kRT] ? double(st.hit[kRT]) / st.opp[kRT] : 0.0,
                 st.slaSamples ? double(st.slaViol) / st.slaSamples : 0.0, maxElErr,
                 (unsigned long)st.kpmDelivered, (unsigned long)st.kpmCodecFail);
+    if (up.numUes > 0)
+    {
+        WriteUserPlane();
+    }
     Simulator::Destroy();
     return 0;
 }
